@@ -2,11 +2,11 @@
 # Run from the repository root after a signed Tauri macOS build.
 set -euo pipefail
 
-tag=${1:?Expected custom-vMAJOR.MINOR.PATCH}
+tag=${1:?Expected ran-vMAJOR.MINOR.PATCH}
 bundle=${2:?Expected Tauri macOS bundle directory}
 out=${3:?Expected new output directory}
-[[ "$tag" =~ ^custom-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-version=${tag#custom-v}
+[[ "$tag" =~ ^ran-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+version=${tag#ran-v}
 repo=AyasukaRan/cc-switch
 app="$bundle/CC Switch.app"
 archive="$bundle/CC Switch.app.tar.gz"
@@ -28,7 +28,7 @@ mkdir "$out"
 ditto -c -k --sequesterRsrc --keepParent "$app" "$out/$base.zip"
 cp "$archive" "$out/$base.app.tar.gz"
 cp "$archive.sig" "$out/$base.app.tar.gz.sig"
-jq -n --arg version "$version" --arg tag "$tag" --arg date "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+jq -n --arg version "$version" --arg date "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
   --arg signature "$(cat "$archive.sig")" --arg url "https://github.com/$repo/releases/download/$tag/$base.app.tar.gz" \
-  '{version: $version, notes: ("CC Switch Custom " + $tag), pub_date: $date,
+  '{version: $version, notes: ("ran v" + $version), pub_date: $date,
     platforms: {"darwin-aarch64": {signature: $signature, url: $url}}}' > "$out/latest.json"

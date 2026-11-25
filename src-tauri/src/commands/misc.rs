@@ -105,7 +105,7 @@ fn custom_release_url(version: &str) -> String {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
     if looks_like_version {
-        format!("{RELEASES}/tag/custom-v{version}")
+        format!("{RELEASES}/tag/ran-v{version}")
     } else {
         format!("{RELEASES}/latest")
     }
@@ -1086,11 +1086,11 @@ mod tests {
     fn manual_update_targets_the_custom_release() {
         assert_eq!(
             custom_release_url("4.0.36"),
-            "https://github.com/AyasukaRan/cc-switch/releases/tag/custom-v4.0.36"
+            "https://github.com/AyasukaRan/cc-switch/releases/tag/ran-v4.0.36"
         );
         assert_eq!(
             custom_release_url("v4.1.0-beta.1"),
-            "https://github.com/AyasukaRan/cc-switch/releases/tag/custom-v4.1.0-beta.1"
+            "https://github.com/AyasukaRan/cc-switch/releases/tag/ran-v4.1.0-beta.1"
         );
         for bad in ["", "v", "latest", "4.0/../x", "4.0.0?x=1"] {
             assert_eq!(

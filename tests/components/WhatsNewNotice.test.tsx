@@ -200,7 +200,7 @@ describe("WhatsNewNotice", () => {
       screen.getAllByRole("button", { name: "whatsNew.versionDetails" })[0],
     );
     expect(mocks.openExternal).toHaveBeenCalledWith(
-      "https://github.com/AyasukaRan/cc-switch/releases/tag/custom-v4.0.4",
+      "https://github.com/AyasukaRan/cc-switch/releases/tag/ran-v4.0.4",
     );
 
     fireEvent.click(screen.getByRole("button", { name: "whatsNew.viewFull" }));

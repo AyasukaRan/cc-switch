@@ -1,9 +1,9 @@
-name: Publish CC Switch Custom for Apple Silicon
+name: Publish ran for Apple Silicon
 
 on:
   push:
     tags:
-      - 'custom-v*'
+      - 'ran-v*'
 
 permissions:
   contents: write
@@ -29,8 +29,8 @@ jobs:
         run: |
           set -euo pipefail
           git merge-base --is-ancestor HEAD refs/remotes/origin/feat/ran
-          [[ "$TAG" =~ ^custom-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          version=${TAG#custom-v}
+          [[ "$TAG" =~ ^ran-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          version=${TAG#ran-v}
           for file in package.json src-tauri/tauri.conf.json "src/whats-new/$version.json"; do
             jq -e --arg version "$version" '.version == $version' "$file" >/dev/null
           done
@@ -46,7 +46,7 @@ jobs:
           list="$RUNNER_TEMP/custom-releases.json"
           gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$list"
           state=$(jq -r --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)] | if length == 0 then "new" elif .[0].draft then "draft" else "published" end' "$list")
-          latest=$(jq -r --arg tag "$TAG" '([.[][] | select(.draft == false and .prerelease == false) | .tag_name | select(test("^custom-v[0-9]+\\.[0-9]+\\.[0-9]+$"))] + [$tag]) | max_by(ltrimstr("custom-v") | split(".") | map(tonumber)) == $tag' "$list")
+          latest=$(jq -r --arg tag "$TAG" '([.[][] | select(.draft == false and .prerelease == false) | .tag_name | select(test("^ran-v[0-9]+\\.[0-9]+\\.[0-9]+$"))] + [$tag]) | max_by(ltrimstr("ran-v") | split(".") | map(tonumber)) == $tag' "$list")
           echo "state=$state" >> "$GITHUB_OUTPUT"
           echo "latest=$latest" >> "$GITHUB_OUTPUT"
 
@@ -87,11 +87,15 @@ jobs:
           LATEST: ${{ steps.release.outputs.latest }}
         run: |
           set -euo pipefail
+          # A maintainer can publish the verified local build while the macOS runner builds.
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || true)" == false ]]; then
+            exit 0
+          fi
           notes="$RUNNER_TEMP/custom-release-notes.md"
           printf 'CC Switch 魔改版，适用于 Apple Silicon Mac。下载 zip，解压后将应用拖入「应用程序」。此构建使用本地签名，未经 Apple 公证。\n\n' > "$notes"
-          jq -r '.items[] | "- " + .zh' "src/whats-new/${TAG#custom-v}.json" >> "$notes"
+          jq -r '.items[] | "- " + .zh' "src/whats-new/${TAG#ran-v}.json" >> "$notes"
           if [[ "$STATE" == new ]]; then
-            gh release create "$TAG" --draft --verify-tag --title "CC Switch Custom $TAG" --notes-file "$notes"
+            gh release create "$TAG" --draft --verify-tag --title "ran ${TAG#ran-}" --notes-file "$notes"
           fi
           gh release upload "$TAG" "$RUNNER_TEMP/release-assets/"* --clobber
           gh release edit "$TAG" --draft=false --prerelease=false --latest="$LATEST" --notes-file "$notes"

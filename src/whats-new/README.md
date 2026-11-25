@@ -2,7 +2,7 @@
 
 用户升级后第一次打开 CC Switch，会弹一个窗口，列出从上次看过的版本到当前版本之间每一版的几条摘要。数据就是这个目录下的文件，构建时打进安装包（`src/lib/whatsNew.ts`），弹窗不联网。
 
-魔改版只展示带有 `"channel": "custom"` 的摘要。每个版本的「详情」打开本仓库对应的 `custom-v<版本>` GitHub Release。
+魔改版只展示带有 `"channel": "custom"` 的摘要。每个版本的「详情」打开本仓库对应的 `ran-v<版本>` GitHub Release。
 
 ## 每个版本一个文件
 

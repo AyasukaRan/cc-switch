@@ -90,7 +90,7 @@ describe("language and links", () => {
 
   it("links to the custom release for a version or lists releases", () => {
     expect(releaseNotesUrl("v4.0.36")).toBe(
-      "https://github.com/AyasukaRan/cc-switch/releases/tag/custom-v4.0.36",
+      "https://github.com/AyasukaRan/cc-switch/releases/tag/ran-v4.0.36",
     );
     expect(releaseNotesUrl()).toBe(
       "https://github.com/AyasukaRan/cc-switch/releases",
