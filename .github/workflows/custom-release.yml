@@ -15,7 +15,7 @@ concurrency:
 jobs:
   release:
     if: github.repository == 'AyasukaRan/cc-switch' && !github.event.deleted
-    runs-on: macos-15
+    runs-on: macos-15-intel
     env:
       TAG: ${{ github.ref_name }}
     steps:
@@ -63,6 +63,7 @@ jobs:
         if: steps.release.outputs.state != 'published'
         run: |
           set -euo pipefail
+          rustup target add aarch64-apple-darwin
           pnpm install --frozen-lockfile
           pnpm exec vitest run tests/config/whatsNewEntries.test.ts
           brew list --versions minisign >/dev/null || brew install minisign
@@ -90,7 +91,7 @@ jobs:
           LATEST: ${{ steps.release.outputs.latest }}
         run: |
           set -euo pipefail
-          # A maintainer can publish the verified local build while the macOS runner builds.
+          # Preserve a published release if this job is retried.
           if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || true)" == false ]]; then
             exit 0
           fi
