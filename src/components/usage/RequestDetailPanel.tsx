@@ -166,6 +166,13 @@ function useDetailSections(request: RequestLog) {
       mono: true,
     });
   }
+  if (request.appType === "codex" && request.serviceTier) {
+    basic.push({
+      key: "serviceTier",
+      label: t("usage.serviceTier"),
+      value: request.serviceTier,
+    });
+  }
   if (request.pricingModel && request.pricingModel !== request.model) {
     basic.push({
       key: "pricingModel",

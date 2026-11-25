@@ -392,6 +392,66 @@ experimental_bearer_token = "live-key"
 }
 
 #[test]
+fn codex_startup_import_and_passive_sync_keep_the_local_document() {
+    let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    reset_test_fs();
+    let app = AppType::Codex;
+    let path = get_codex_config_path();
+    let auth = json!({"auth_mode": "chatgpt", "tokens": {"access_token": "local-login"}});
+    let original = "# local TOML\r\nmodel_provider = 'aihubmix'\r\n\r\n[model_providers.aihubmix]\r\nenv_key = 'WORK_KEY'\r\nbase_url = 'https://relay.example/v1'\r\n\r\n[projects.work]\r\ntrust_level = 'trusted' # keep";
+    write_codex_live_atomic(&auth, Some(original)).unwrap();
+    let before_auth = std::fs::read(get_codex_auth_path()).unwrap();
+    let state = create_test_state().unwrap();
+    import_default_config_test_hook(&state, app.clone()).unwrap();
+    state.db.init_default_official_providers().unwrap();
+    let card = || {
+        state
+            .db
+            .get_provider_by_id("default", &app)
+            .unwrap()
+            .unwrap()
+    };
+    assert!(card().uses_codex_full_config());
+    assert_eq!(card().settings_config["config"], original);
+
+    let updated = original.replace("local TOML", "updated in Codex");
+    std::fs::write(&path, &updated).unwrap();
+    let updated_at = std::fs::metadata(&path).unwrap().modified().unwrap();
+    state
+        .db
+        .save_mcp_server(&McpServer {
+            id: "synced".into(),
+            name: "Synced".into(),
+            server: json!({"command": "echo"}),
+            apps: McpApps {
+                codex: true,
+                ..Default::default()
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: vec![],
+        })
+        .unwrap();
+    ProviderService::sync_current_to_live(&state).unwrap();
+    assert_eq!(card().settings_config["config"], updated);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), updated);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        updated_at
+    );
+    assert_eq!(std::fs::read(get_codex_auth_path()).unwrap(), before_auth);
+    // An explicit MCP setting belongs to managed providers as soon as the
+    // local file is imported. It must not edit that full file in place.
+    cc_switch_lib::McpService::sync_enabled_for_app(&state, &app).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), updated);
+    ProviderService::switch(&state, app.clone(), "codex-official").unwrap();
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("[mcp_servers.synced]"));
+}
+
+#[test]
 fn codex_startup_import_marks_oauth_only_default_official() {
     let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
     reset_test_fs();

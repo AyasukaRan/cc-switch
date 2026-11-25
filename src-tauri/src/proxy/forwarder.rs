@@ -93,6 +93,7 @@ pub struct ForwardResult {
     /// usage 归因不能依赖 ctx.request_model（映射前的客户端别名）：上游响应
     /// 缺失 model 或回显别名时，接管流量会被记成 claude-* 并按其定价计费。
     pub outbound_model: Option<String>,
+    pub outbound_service_tier: Option<String>,
     /// 活跃连接 RAII guard：随响应一起流转到 response_processor / handle_claude_transform，
     /// 最终被 move 进流式 body future（或非流式响应作用域），覆盖整个响应生命周期。
     pub(crate) connection_guard: Option<ActiveConnectionGuard>,
@@ -572,8 +573,9 @@ impl RequestForwarder {
         provider: &Provider,
         app_type: &AppType,
         used_half_open_permit: bool,
-        (response, claude_api_format, outbound_model): (
+        (response, claude_api_format, outbound_model, outbound_service_tier): (
             ProxyResponse,
+            Option<String>,
             Option<String>,
             Option<String>,
         ),
@@ -585,6 +587,7 @@ impl RequestForwarder {
             claude_api_format,
             codex_upstream_format,
             outbound_model,
+            outbound_service_tier,
             connection_guard: None,
         };
         if !self.routing_state_enabled() {
@@ -1328,7 +1331,7 @@ impl RequestForwarder {
 
     /// 转发单个请求（使用适配器）
     ///
-    /// 成功时返回 `(response, claude_api_format, outbound_model)`，其中
+    /// 成功时返回响应、协议以及最后一次上游请求的模型和档位，其中
     /// `outbound_model` 是最终发往上游的模型名（所有映射/改写之后）。
     /// `codex_upstream_format_out` 记下这次实际选中的 Codex 上游格式：成功时交给
     /// `finish_success`，失败时给整流判断用（Copilot 按模型逐次选协议，不能从静态配置推）。
@@ -1337,7 +1340,15 @@ impl RequestForwarder {
         attempt: &Attempt<'_>,
         body: &Value,
         codex_upstream_format_out: &mut Option<CodexUpstreamFormat>,
-    ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+    ) -> Result<
+        (
+            ProxyResponse,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+        ProxyError,
+    > {
         let Attempt {
             app_type,
             method,
@@ -2131,6 +2142,14 @@ impl RequestForwarder {
             outbound_model = Some(m.to_string());
         }
         self.set_last_outbound_model(outbound_model.clone());
+        let outbound_service_tier = if matches!(app_type, AppType::Codex) {
+            filtered_body
+                .get("service_tier")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        } else {
+            None
+        };
         log_prompt_cache_trace(
             app_type,
             provider,
@@ -2407,7 +2426,12 @@ impl RequestForwarder {
                     opaque_state_request.as_ref(),
                 )
                 .await?;
-            Ok((response, resolved_claude_api_format, outbound_model))
+            Ok((
+                response,
+                resolved_claude_api_format,
+                outbound_model,
+                outbound_service_tier,
+            ))
         } else {
             Err(upstream_error(response).await?)
         }

@@ -252,6 +252,44 @@ describe("EditProviderDialog", () => {
     expect(payload.editorSave).toEqual({ base: view, onConflict: "refuse" });
   });
 
+  it("keeps a complete card closed to edits until its file is readable, then sends the text from open as its save base", async () => {
+    const provider: Provider = {
+      id: "full",
+      name: "Full",
+      category: "custom",
+      settingsConfig: { auth: {}, config: "# saved" },
+      meta: { codexFullConfig: true },
+    };
+    const live = { auth: {}, config: "# changed on disk\n" };
+    apiMocks.getEditorView
+      .mockRejectedValueOnce(new Error("read denied"))
+      .mockResolvedValueOnce({ settings: live, inactive: [] });
+    const onSubmit = vi.fn();
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        isCurrent
+        appId="codex"
+        onSubmit={onSubmit}
+        onOpenChange={vi.fn()}
+      />,
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent("read denied");
+    expect(screen.getByRole("button", { name: "common.save" })).toBeDisabled();
+    expect(screen.queryByTestId("settings-config")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "common.retry" }));
+    expect(
+      JSON.parse((await screen.findByTestId("settings-config")).textContent!),
+    ).toEqual(live);
+    fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    expect(onSubmit.mock.calls[0][0].editorSave).toEqual({
+      base: live,
+      onConflict: "refuse",
+    });
+  });
+
   it.each([undefined, "openai_responses"] as const)(
     "passes stored Copilot metadata to the edit projection (%s)",
     async (format) => {

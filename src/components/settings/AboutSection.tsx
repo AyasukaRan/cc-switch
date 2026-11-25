@@ -21,6 +21,7 @@ import { useUpdate } from "@/contexts/UpdateContext";
 import { Badge } from "@/components/ui/badge";
 import { WhatsNewDialog } from "@/components/WhatsNewDialog";
 import { WHATS_NEW_ENTRIES, entriesUpTo } from "@/lib/whatsNew";
+import { releaseNotesUrl } from "@/lib/releaseLinks";
 import ccswitchLogo from "@/assets/icons/logo.svg";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { Switch } from "@/components/ui/switch";
@@ -128,22 +129,8 @@ export function AboutSection({
 
   const handleOpenReleaseNotes = useCallback(async () => {
     try {
-      const targetVersion = updateInfo?.availableVersion ?? version ?? "";
-      const displayVersion = targetVersion.startsWith("v")
-        ? targetVersion
-        : targetVersion
-          ? `v${targetVersion}`
-          : "";
-
-      if (!displayVersion) {
-        await settingsApi.openExternal(
-          "https://github.com/farion1231/cc-switch/releases",
-        );
-        return;
-      }
-
       await settingsApi.openExternal(
-        `https://github.com/farion1231/cc-switch/releases/tag/${displayVersion}`,
+        releaseNotesUrl(updateInfo?.availableVersion ?? version),
       );
     } catch (error) {
       console.error("[AboutSection] Failed to open release notes", error);
@@ -387,7 +374,7 @@ export function AboutSection({
         )}
       </div>
 
-      {/* 下载与更新都走 ccswitch.io，用户不再经过仓库页，邀 Star 单独占一行；按钮即 GitHub 入口。
+      {/* 邀 Star 单独占一行；按钮即 GitHub 入口。
           关掉后链接行补回 GitHub 按钮 */}
       {!starPromptDismissed && (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-3 bg-action-soft py-3.5 ps-5 pe-3">

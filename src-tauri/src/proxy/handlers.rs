@@ -12,8 +12,8 @@ use super::{
     error_mapper::{get_error_message, map_proxy_error_to_status},
     forwarder::{ActiveConnectionGuard, CodexUpstreamFormat},
     handler_config::{
-        claude_stream_usage_event_filter, codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG,
-        CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
+        claude_stream_usage_event_filter, CLAUDE_PARSER_CONFIG, CODEX_PARSER_CONFIG,
+        GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
     },
     handler_context::RequestContext,
     providers::{
@@ -36,9 +36,10 @@ use super::{
         transform_gemini, transform_responses,
     },
     response_processor::{
-        create_logged_passthrough_stream, create_usage_collector, process_response,
-        read_decoded_body, strip_entity_headers_for_rebuilt_body,
-        strip_hop_by_hop_response_headers, usage_logging_enabled, SseUsageCollector,
+        create_logged_passthrough_stream, create_usage_collector, log_usage_internal as log_usage,
+        process_response, read_decoded_body, spawn_log_usage,
+        strip_entity_headers_for_rebuilt_body, strip_hop_by_hop_response_headers,
+        usage_logging_enabled, SseUsageCollector,
     },
     server::ProxyState,
     sse::{strip_sse_field, SseBlocks},
@@ -47,7 +48,6 @@ use super::{
     ProxyError,
 };
 use crate::app_config::AppType;
-use crate::database::PRICING_SOURCE_REQUEST;
 use crate::provider_kind::ProviderKind;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use bytes::Bytes;
@@ -594,6 +594,7 @@ async fn write_claude_usage_log(state: &ProxyState, log: ClaudeUsageLog) {
         &log.model,
         &log.request_model,
         &log.outbound_model,
+        None,
         log.usage,
         log.latency_ms,
         None,
@@ -701,6 +702,7 @@ async fn handle_claude_transform(
             Some(SseUsageCollector::new(
                 start_time,
                 Some(claude_stream_usage_event_filter),
+                false,
                 move |events, first_token_ms| {
                     let parsed = if final_delta_authoritative {
                         TokenUsage::from_converted_claude_stream_events(&events)
@@ -729,6 +731,7 @@ async fn handle_claude_transform(
                                 &model,
                                 &request_model,
                                 &outbound_model,
+                                None,
                                 usage,
                                 latency_ms,
                                 first_token_ms,
@@ -1061,6 +1064,7 @@ pub async fn handle_chat_completions(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    ctx.outbound_service_tier = result.outbound_service_tier.take();
     ctx.provider = result.provider;
     let response = result.response;
 
@@ -1218,6 +1222,7 @@ async fn handle_responses_for_app(
     let connection_guard = result.connection_guard.take();
     let codex_upstream_format = result.codex_upstream_format;
     ctx.outbound_model = result.outbound_model.take();
+    ctx.outbound_service_tier = result.outbound_service_tier.take();
     ctx.provider = result.provider;
     let response = result.response;
 
@@ -1351,7 +1356,8 @@ async fn handle_codex_native_compaction_response(
     let compaction_stream = super::providers::codex_compaction::create_native_compaction_sse_stream(
         codex_native_responses_stream(response, ctx),
     );
-    let usage_collector = create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
+    let usage_collector =
+        create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG, false);
     let logged_stream = create_logged_passthrough_stream(
         compaction_stream,
         ctx.tag,
@@ -1477,6 +1483,7 @@ async fn handle_codex_standalone_passthrough(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    ctx.outbound_service_tier = result.outbound_service_tier.take();
     ctx.provider = result.provider;
 
     process_response(
@@ -1532,7 +1539,8 @@ async fn handle_codex_late_arguments_repair(
         super::providers::responses_late_arguments::create_late_arguments_repair_stream(
             codex_native_responses_stream(response, ctx),
         );
-    let usage_collector = create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
+    let usage_collector =
+        create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG, false);
     let logged_stream = create_logged_passthrough_stream(
         repair_stream,
         ctx.tag,
@@ -1602,7 +1610,7 @@ async fn handle_codex_xai_native_responses_rewrite(
                 restore_map,
             );
         let usage_collector =
-            create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
+            create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG, false);
         let logged_stream = create_logged_passthrough_stream(
             restore_stream,
             ctx.tag,
@@ -1643,48 +1651,7 @@ async fn handle_codex_xai_native_responses_rewrite(
             transform_codex_responses_xai_sanitize::normalize_xai_function_call_integer_arguments(
                 &mut value,
             );
-            if let Some(usage) =
-                TokenUsage::from_codex_response_auto(&value).filter(TokenUsage::has_billable_tokens)
-            {
-                let model = value
-                    .get("model")
-                    .and_then(|m| m.as_str())
-                    .filter(|m| !m.is_empty())
-                    .map(str::to_string)
-                    .or_else(|| ctx.outbound_model.clone())
-                    .unwrap_or_else(|| ctx.request_model.clone());
-                let request_model = ctx.request_model.clone();
-                let outbound_model = ctx
-                    .outbound_model
-                    .clone()
-                    .unwrap_or_else(|| ctx.request_model.clone());
-                let app_type_str = ctx.app_type_str;
-                tokio::spawn({
-                    let state = state.clone();
-                    let provider_id = ctx.provider.id.clone();
-                    let multiplier = crate::provider::billing_multiplier(&ctx.provider);
-                    let session_id = ctx.session_id.clone();
-                    let latency_ms = ctx.latency_ms();
-                    async move {
-                        log_usage(
-                            &state,
-                            &provider_id,
-                            multiplier,
-                            app_type_str,
-                            &model,
-                            &request_model,
-                            &outbound_model,
-                            usage,
-                            latency_ms,
-                            None,
-                            false,
-                            status.as_u16(),
-                            Some(session_id),
-                        )
-                        .await;
-                    }
-                });
-            }
+            log_codex_response_usage(state, ctx, &value, status);
             match serde_json::to_vec(&value) {
                 Ok(bytes) => Bytes::from(bytes),
                 Err(e) => {
@@ -1742,71 +1709,8 @@ async fn handle_codex_chat_to_responses_transform(
             ctx.session_client_provided.then(|| ctx.session_id.clone()),
         );
 
-        let usage_collector = if usage_logging_enabled(state) {
-            let state = state.clone();
-            let provider_id = ctx.provider.id.clone();
-            let multiplier = crate::provider::billing_multiplier(&ctx.provider);
-            let request_model = ctx.request_model.clone();
-            // 接管/模型覆写场景的归因兜底：出站真值优先于客户端请求别名
-            let fallback_model = ctx
-                .outbound_model
-                .clone()
-                .unwrap_or_else(|| ctx.request_model.clone());
-            let app_type_str = ctx.app_type_str;
-            let start_time = ctx.start_time;
-            let session_id = ctx.session_id.clone();
-
-            Some(SseUsageCollector::new(
-                start_time,
-                Some(codex_stream_usage_event_filter),
-                move |events, first_token_ms| {
-                    let usage =
-                        TokenUsage::from_codex_stream_events_auto(&events).unwrap_or_default();
-                    // 上游遵守 OpenAI 语义省略 usage 时，Chat→Responses 转换器会合成一个
-                    // 全 0 的 response.completed，from_codex_response 对 input/output 字段
-                    // 存在（哪怕=0）即返回 Some。缺 nonzero 闸门会让全 0 usage 也被写入：
-                    // message_id=None → dedup_request_id 退化为随机 UUID，无法去重，每笔
-                    // 请求插入一条无意义空行、虚增请求数。对齐 Claude transform handler 的 skip。
-                    if !usage.has_billable_tokens() {
-                        log::debug!("[Codex] 流式响应 usage 全 0 或缺失，跳过消费记录");
-                        return;
-                    }
-                    let model = usage
-                        .model
-                        .clone()
-                        .filter(|m| !m.is_empty())
-                        .unwrap_or_else(|| fallback_model.clone());
-                    let latency_ms = start_time.elapsed().as_millis() as u64;
-
-                    let state = state.clone();
-                    let provider_id = provider_id.clone();
-                    let request_model = request_model.clone();
-                    let outbound_model = fallback_model.clone();
-                    let session_id = session_id.clone();
-
-                    tokio::spawn(async move {
-                        log_usage(
-                            &state,
-                            &provider_id,
-                            multiplier,
-                            app_type_str,
-                            &model,
-                            &request_model,
-                            &outbound_model,
-                            usage,
-                            latency_ms,
-                            first_token_ms,
-                            true,
-                            status.as_u16(),
-                            Some(session_id),
-                        )
-                        .await;
-                    });
-                },
-            ))
-        } else {
-            None
-        };
+        let usage_collector =
+            create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG, true);
 
         let logged_stream = create_logged_passthrough_stream(
             sse_stream,
@@ -1889,48 +1793,7 @@ async fn handle_codex_chat_to_responses_transform(
     // (transform_codex_chat.rs:1581)，from_codex_response 对 input/output 字段存在(哪怕=0)
     // 即返回 Some。用 has_billable_tokens 闸门跳过全 0，避免空行虚增请求数——与流式分支
     // 及 Claude transform handler 的 skip 行为对齐。
-    if let Some(usage) = TokenUsage::from_codex_response_auto(&responses_response)
-        .filter(TokenUsage::has_billable_tokens)
-    {
-        let model = responses_response
-            .get("model")
-            .and_then(|m| m.as_str())
-            .filter(|m| !m.is_empty())
-            .map(str::to_string)
-            .or_else(|| ctx.outbound_model.clone())
-            .unwrap_or_else(|| ctx.request_model.clone());
-        let request_model = ctx.request_model.clone();
-        let outbound_model = ctx
-            .outbound_model
-            .clone()
-            .unwrap_or_else(|| ctx.request_model.clone());
-        let app_type_str = ctx.app_type_str;
-        tokio::spawn({
-            let state = state.clone();
-            let provider_id = ctx.provider.id.clone();
-            let multiplier = crate::provider::billing_multiplier(&ctx.provider);
-            let session_id = ctx.session_id.clone();
-            let latency_ms = ctx.latency_ms();
-            async move {
-                log_usage(
-                    &state,
-                    &provider_id,
-                    multiplier,
-                    app_type_str,
-                    &model,
-                    &request_model,
-                    &outbound_model,
-                    usage,
-                    latency_ms,
-                    None,
-                    false,
-                    status.as_u16(),
-                    Some(session_id),
-                )
-                .await;
-            }
-        });
-    }
+    log_codex_response_usage(state, ctx, &responses_response, status);
 
     strip_entity_headers_for_rebuilt_body(&mut response_headers);
     strip_hop_by_hop_response_headers(&mut response_headers);
@@ -2056,48 +1919,7 @@ async fn handle_codex_anthropic_to_responses_transform(
             e
         })?;
 
-    if let Some(usage) = TokenUsage::from_codex_response_auto(&responses_response)
-        .filter(TokenUsage::has_billable_tokens)
-    {
-        let model = responses_response
-            .get("model")
-            .and_then(|m| m.as_str())
-            .filter(|m| !m.is_empty())
-            .map(str::to_string)
-            .or_else(|| ctx.outbound_model.clone())
-            .unwrap_or_else(|| ctx.request_model.clone());
-        let request_model = ctx.request_model.clone();
-        let outbound_model = ctx
-            .outbound_model
-            .clone()
-            .unwrap_or_else(|| ctx.request_model.clone());
-        let app_type_str = ctx.app_type_str;
-        tokio::spawn({
-            let state = state.clone();
-            let provider_id = ctx.provider.id.clone();
-            let multiplier = crate::provider::billing_multiplier(&ctx.provider);
-            let session_id = ctx.session_id.clone();
-            let latency_ms = ctx.latency_ms();
-            async move {
-                log_usage(
-                    &state,
-                    &provider_id,
-                    multiplier,
-                    app_type_str,
-                    &model,
-                    &request_model,
-                    &outbound_model,
-                    usage,
-                    latency_ms,
-                    None,
-                    false,
-                    status.as_u16(),
-                    Some(session_id),
-                )
-                .await;
-            }
-        });
-    }
+    log_codex_response_usage(state, ctx, &responses_response, status);
 
     strip_entity_headers_for_rebuilt_body(&mut response_headers);
     strip_hop_by_hop_response_headers(&mut response_headers);
@@ -2125,6 +1947,33 @@ async fn handle_codex_anthropic_to_responses_transform(
         })
 }
 
+fn log_codex_response_usage(
+    state: &ProxyState,
+    ctx: &RequestContext,
+    response: &Value,
+    status: StatusCode,
+) {
+    if let Some(usage) =
+        TokenUsage::from_codex_response_auto(response).filter(TokenUsage::has_billable_tokens)
+    {
+        let model = usage
+            .model
+            .clone()
+            .filter(|model| !model.is_empty())
+            .or_else(|| ctx.outbound_model.clone())
+            .unwrap_or_else(|| ctx.request_model.clone());
+        spawn_log_usage(
+            state,
+            ctx,
+            usage,
+            &model,
+            Some(response),
+            status.as_u16(),
+            false,
+        );
+    }
+}
+
 fn build_codex_anthropic_sse_response(
     sse_stream: impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     ctx: &RequestContext,
@@ -2132,64 +1981,8 @@ fn build_codex_anthropic_sse_response(
     status: StatusCode,
     connection_guard: Option<ActiveConnectionGuard>,
 ) -> Result<axum::response::Response, ProxyError> {
-    let usage_collector = if usage_logging_enabled(state) {
-        let state = state.clone();
-        let provider_id = ctx.provider.id.clone();
-        let multiplier = crate::provider::billing_multiplier(&ctx.provider);
-        let request_model = ctx.request_model.clone();
-        let fallback_model = ctx
-            .outbound_model
-            .clone()
-            .unwrap_or_else(|| ctx.request_model.clone());
-        let app_type_str = ctx.app_type_str;
-        let start_time = ctx.start_time;
-        let session_id = ctx.session_id.clone();
-
-        Some(SseUsageCollector::new(
-            start_time,
-            Some(codex_stream_usage_event_filter),
-            move |events, first_token_ms| {
-                let usage = TokenUsage::from_codex_stream_events_auto(&events).unwrap_or_default();
-                if !usage.has_billable_tokens() {
-                    log::debug!("[Codex] Anthropic streaming response usage is all-zero or missing, skipping usage recording");
-                    return;
-                }
-                let model = usage
-                    .model
-                    .clone()
-                    .filter(|m| !m.is_empty())
-                    .unwrap_or_else(|| fallback_model.clone());
-                let latency_ms = start_time.elapsed().as_millis() as u64;
-
-                let state = state.clone();
-                let provider_id = provider_id.clone();
-                let request_model = request_model.clone();
-                let outbound_model = fallback_model.clone();
-                let session_id = session_id.clone();
-
-                tokio::spawn(async move {
-                    log_usage(
-                        &state,
-                        &provider_id,
-                        multiplier,
-                        app_type_str,
-                        &model,
-                        &request_model,
-                        &outbound_model,
-                        usage,
-                        latency_ms,
-                        first_token_ms,
-                        true,
-                        status.as_u16(),
-                        Some(session_id),
-                    )
-                    .await;
-                });
-            },
-        ))
-    } else {
-        None
-    };
+    let usage_collector =
+        create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG, true);
 
     let logged_stream = create_logged_passthrough_stream(
         sse_stream,
@@ -2933,6 +2726,7 @@ fn chat_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
     let mut id = Value::Null;
     let mut created = Value::Null;
     let mut model = Value::Null;
+    let mut service_tier = None;
     let mut content = String::new();
     let mut reasoning_content = String::new();
     // tool_calls 以 BTreeMap 按 index 聚合：上游可控的 index（u64）不会 densify
@@ -3002,6 +2796,9 @@ fn chat_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
                         *slot = v.clone();
                     }
                 }
+            }
+            if let Some(tier) = chunk.get("service_tier").and_then(Value::as_str) {
+                service_tier = Some(tier.to_owned());
             }
             // OpenAI 语义：usage 只在最终 chunk 非 null
             if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
@@ -3178,6 +2975,9 @@ fn chat_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
             "finish_reason": finish_reason,
         }],
     });
+    if let Some(tier) = service_tier {
+        response["service_tier"] = json!(tier);
+    }
     if !usage.is_null() {
         response["usage"] = usage;
     }
@@ -3300,81 +3100,6 @@ async fn log_forward_error(
         )))
     }) {
         log::warn!("记录失败请求日志失败: {e}");
-    }
-}
-
-/// 记录请求使用量
-///
-/// `outbound_model` 是「按请求计价」模式的锚点：实际发往上游的模型
-/// （路由接管映射后的真值，无映射时等于 request_model）。
-#[allow(clippy::too_many_arguments)]
-async fn log_usage(
-    state: &ProxyState,
-    provider_id: &str,
-    multiplier: rust_decimal::Decimal,
-    app_type: &str,
-    model: &str,
-    request_model: &str,
-    outbound_model: &str,
-    usage: TokenUsage,
-    latency_ms: u64,
-    first_token_ms: Option<u64>,
-    is_streaming: bool,
-    status_code: u16,
-    session_id: Option<String>,
-) {
-    use super::usage::logger::UsageLogger;
-
-    if !usage_logging_enabled(state) {
-        return;
-    }
-
-    let dedup_scope = super::usage::parser::dedup_scope_for_app(app_type, provider_id);
-    let request_id = usage.dedup_request_id(dedup_scope);
-
-    // #7818：使用量写入要拿 Database 的单把 std::sync::Mutex<Connection> 并做
-    // 磁盘 IO，同步执行会卡住 tokio worker，移到阻塞线程池执行。计费模式
-    // 读取走同一把锁，一并移入。
-    let db = state.db.clone();
-    let provider_id = provider_id.to_string();
-    let app_type = app_type.to_string();
-    let model = model.to_string();
-    let request_model = request_model.to_string();
-    let outbound_model = outbound_model.to_string();
-    let write = tokio::task::spawn_blocking(move || {
-        let logger = UsageLogger::new(&db);
-        // 计费模式读取的 DAO 是伪 async（无真实挂起点、直接取阻塞锁），
-        // 在阻塞线程上 block_on 不会停转运行时
-        let pricing_model_source = tokio::runtime::Handle::current()
-            .block_on(logger.resolve_pricing_model_source(&app_type));
-        let pricing_model = if pricing_model_source == PRICING_SOURCE_REQUEST {
-            outbound_model
-        } else {
-            model.clone()
-        };
-        logger.log_with_calculation(
-            request_id,
-            provider_id,
-            multiplier,
-            app_type,
-            model,
-            request_model,
-            pricing_model,
-            usage,
-            latency_ms,
-            first_token_ms,
-            status_code,
-            session_id,
-            None, // provider_type
-            is_streaming,
-        )
-    });
-    if let Err(e) = write.await.unwrap_or_else(|e| {
-        Err(crate::error::AppError::Database(format!(
-            "usage 记录任务失败: {e}"
-        )))
-    }) {
-        log::warn!("[USG-001] 记录使用量失败: {e}");
     }
 }
 
@@ -3790,7 +3515,7 @@ data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant
 
     #[test]
     fn chat_sse_to_response_value_aggregates_text_finish_reason_and_usage() {
-        let sse = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"gpt-5.4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n\
+        let sse = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"gpt-5.4\",\"service_tier\":\"flex\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n\
 data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n\
 data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\n\
 data: [DONE]\n\n";
@@ -3800,6 +3525,7 @@ data: [DONE]\n\n";
         assert_eq!(response["id"], "chatcmpl-1");
         assert_eq!(response["object"], "chat.completion");
         assert_eq!(response["model"], "gpt-5.4");
+        assert_eq!(response["service_tier"], "flex");
         assert_eq!(response["choices"][0]["message"]["role"], "assistant");
         assert_eq!(response["choices"][0]["message"]["content"], "Hello");
         assert_eq!(response["choices"][0]["finish_reason"], "stop");

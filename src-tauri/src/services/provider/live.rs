@@ -811,6 +811,8 @@ pub(crate) enum LiveSyncOutcome {
     WroteLive,
     /// 应用在代理模式：live 是代理契约，没有按直连写。
     ProxyMode,
+    /// The existing local Codex file takes precedence during background sync.
+    KeptLocal,
 }
 
 /// 把 `provider` 同步到 live，按应用的模式处理：
@@ -854,6 +856,26 @@ pub(crate) fn sync_current_provider_for_app_respecting_mode(
     app_type: &AppType,
 ) -> Result<Option<LiveSyncOutcome>, AppError> {
     let _switch_guard = crate::mode::controller::lock_settled_blocking(state, app_type)?;
+    if matches!(app_type, AppType::Codex) && !crate::mode::current::is_proxy(app_type) {
+        let provider = crate::mode::current::direct_provider(&state.db, app_type)?;
+        if crate::codex_config::read_optional_codex_config_text()?.is_some() {
+            if let Some(provider) = provider {
+                super::codex_full_config::adopt_active(&state.db, &provider)?;
+            }
+            return Ok(Some(LiveSyncOutcome::KeptLocal));
+        }
+        let Some(provider) = provider else {
+            return Ok(None);
+        };
+        super::codex_direct::initialize_direct(
+            &state.db,
+            &state.codex_oauth_manager,
+            super::codex_direct::Owner::Provider(&provider),
+            &provider,
+            crate::mode::state::PendingTarget::default(),
+        )?;
+        return Ok(Some(LiveSyncOutcome::WroteLive));
+    }
     let current_id = match crate::mode::current::provider_for(
         &state.db,
         app_type,
@@ -906,6 +928,7 @@ pub(crate) fn initialize_dsh_profiles(state: &AppState) -> Result<(), AppError> 
 /// For additive mode apps (OpenCode), all providers are synced instead of just the current one.
 pub fn sync_current_to_live(state: &AppState) -> Result<(), AppError> {
     let mut failures = Vec::new();
+    let mut keep_local_codex = false;
     if let Err(error) = initialize_dsh_profiles(state) {
         failures.push(format!("provider/dsh: {error}"));
     }
@@ -930,7 +953,12 @@ pub fn sync_current_to_live(state: &AppState) -> Result<(), AppError> {
             // Switch mode: sync only current provider. During proxy takeover,
             // update the restore backup instead of rewriting the taken-over
             // live file.
-            sync_current_provider_for_app_respecting_mode(state, &app_type).map(|_| ())
+            let outcome = sync_current_provider_for_app_respecting_mode(state, &app_type);
+            if app_type == AppType::Codex {
+                keep_local_codex =
+                    matches!(&outcome, Ok(Some(LiveSyncOutcome::KeptLocal)) | Err(_));
+            }
+            outcome.map(|_| ())
         };
 
         if let Err(error) = result {
@@ -941,7 +969,10 @@ pub fn sync_current_to_live(state: &AppState) -> Result<(), AppError> {
 
     // MCP sync is already best-effort per application. Preserve its aggregate
     // error while continuing with Skills.
-    if let Err(error) = McpService::sync_all_enabled(state) {
+    if let Err(error) = McpService::sync_enabled_for_apps(
+        state,
+        AppType::all().filter(|app| !(keep_local_codex && *app == AppType::Codex)),
+    ) {
         failures.push(format!("mcp: {error}"));
     }
 
@@ -1101,6 +1132,11 @@ pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool
     if !imports_default_config(&app_type) {
         return Ok(false);
     }
+    let _codex_guard = if app_type == AppType::Codex {
+        crate::mode::controller::lock_settled_blocking(state, &app_type)?
+    } else {
+        None
+    };
 
     // 允许 "只有官方 seed 预设" 的情况下继续导入 live：
     // - 启动编排顺序是先 import 后 seed，新用户启动时 providers 为空，导入照常
@@ -1250,7 +1286,10 @@ pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool
                 .get("auth")
                 .is_some_and(crate::codex_config::codex_auth_has_login_material);
 
-            if has_login_material && !has_provider_key {
+            if has_login_material
+                && !has_provider_key
+                && !crate::proxy::providers::has_explicit_codex_third_party_upstream(&provider)
+            {
                 "official"
             } else {
                 "custom"
@@ -1264,6 +1303,17 @@ pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool
         .to_string(),
     );
 
+    if app_type == AppType::Codex
+        && crate::codex_config::read_optional_codex_config_text()?.is_some()
+    {
+        // The imported file already belongs to the user, including comments,
+        // project settings and historical provider IDs.
+        let full = !provider.has_official_category();
+        let meta = provider.meta.get_or_insert_with(Default::default);
+        meta.codex_full_config = full.then_some(true);
+        meta.common_config_enabled = Some(false);
+    }
+
     if matches!(app_type, AppType::Copilot) {
         // 导入的是 Copilot 自己的登录：和预设里的官方卡用同一套名称和图标。
         provider.name = "GitHub Copilot".to_string();
@@ -1276,6 +1326,9 @@ pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool
     if !app_type.spec().additive {
         state.db.set_current_provider(&app_type, &provider.id)?;
         crate::settings::set_current_provider(&app_type, Some(provider.id.as_str()))?;
+    }
+    if app_type == AppType::Codex && provider.uses_codex_full_config() {
+        super::codex_full_config::adopt_active(&state.db, &provider)?;
     }
 
     // 初次导入已有配置时随手补出官方入口，对齐其它应用"首启动 = 导入 default

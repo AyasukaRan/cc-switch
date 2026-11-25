@@ -1,4 +1,4 @@
-//! 写 Codex 的客户端文件：`config.toml` 只替换关键字段和独有字段，其余字节不碰；
+//! 写 Codex 的客户端文件：托管配置只替换关键字段和独有字段，完整配置使用供应商的原文；
 //! `auth.json`、模型目录、托管账号的登录标记、登录暂存和它在同一个操作里提交，崩溃后按
 //! pending 前滚或丢弃。
 //!
@@ -50,6 +50,7 @@ use crate::proxy::providers::codex_oauth_auth::CodexOAuthManager;
 use crate::services::subscription::CodexKeychainLogin;
 use std::sync::Arc;
 
+use super::codex_full_config;
 use super::codex_login::{self, AuthInput, AuthPlan, AuthTarget, LoginStash, STASH_FILENAME};
 use super::codex_official_models::{self, NativeRows, OfficialLogin, OfficialSkip};
 use super::ProviderService;
@@ -270,11 +271,10 @@ pub(crate) fn predicted_official_login(
             .clone()
             .unwrap_or_else(codex_official_models::keychain_login)
     };
-    Ok(
-        login_after(&auth_plan, live.as_ref(), &read_config_text(), keychain)
-            .ok_or(OfficialSkip::NoLogin)
-            .and_then(|auth| OfficialLogin::of(&auth)),
-    )
+    let text = codex_full_config::managed_text()?;
+    Ok(login_after(&auth_plan, live.as_ref(), &text, keychain)
+        .ok_or(OfficialSkip::NoLogin)
+        .and_then(|auth| OfficialLogin::of(&auth)))
 }
 
 /// 按未加锁读到的内容预测这次操作对 `auth.json` 的去向，和读到的 live `auth.json`。只读。
@@ -438,6 +438,7 @@ pub(super) fn exclusive_of(
 /// live 现在对应的那一家带进来的独有字段：切走时值还相同就删。
 pub(crate) fn outgoing_exclusive(owner: &Owner<'_>) -> Vec<(String, TomlValue)> {
     match owner {
+        Owner::Provider(provider) if provider.uses_codex_full_config() => Vec::new(),
         Owner::Provider(provider) => match project(provider) {
             Ok(projection) => exclusive_of(provider, &projection),
             Err(err) => {
@@ -484,6 +485,11 @@ fn row_facts(db: &Database) -> Result<RowFacts, AppError> {
                     facts.official_logins.push(auth.clone());
                 }
             }
+            continue;
+        }
+        if provider.uses_codex_full_config() {
+            // Full documents install neither their tables in the managed
+            // base nor their stored card key in auth.json.
             continue;
         }
         if let Some(key) = auth.and_then(extract_codex_auth_api_key) {
@@ -555,6 +561,10 @@ fn row_auth(provider: &Provider) -> Value {
 /// 在内存里算好的一次 Codex 写入。
 pub(crate) struct Planned {
     config: CodexConfigPatch,
+    full_config: Option<String>,
+    full_config_id: Option<String>,
+    pub(crate) expected_live: Option<String>,
+    pub(super) create_only: bool,
     /// 第三方路由表的凭据来源：写入时按盘上有没有登录定 `requires_openai_auth`。
     stamp: Option<RouteAuth>,
     catalog: Option<Vec<u8>>,
@@ -591,7 +601,14 @@ pub(crate) fn plan(
 ) -> Result<Planned, AppError> {
     let facts = row_facts(db)?;
     let provider = target_provider(target);
-    let projection = provider.map(project).transpose()?;
+    let full_config = match target {
+        Target::Direct(Some(provider)) => codex_full_config::text(provider)?.map(str::to_owned),
+        _ => None,
+    };
+    let projection = provider
+        .filter(|_| full_config.is_none())
+        .map(project)
+        .transpose()?;
 
     let (top, mut nested, mut exclusive) = match (&projection, provider) {
         (Some(projection), Some(provider)) => (
@@ -609,6 +626,9 @@ pub(crate) fn plan(
     let without_login = matches!(target, Target::Proxy { .. })
         && crate::settings::codex_proxy_without_official_login();
     let (route, stamp, auth) = match (target, &projection) {
+        (Target::Direct(Some(_)), None) if full_config.is_some() => {
+            (RouteWrite::Default, None, AuthGoal::ThirdParty)
+        }
         (Target::Direct(None), _) | (_, None) => (RouteWrite::Default, None, AuthGoal::KeepNative),
         (Target::Direct(Some(provider)), Some(projection)) => {
             let auth = match &managed_login {
@@ -797,6 +817,12 @@ pub(crate) fn plan(
     );
     Ok(Planned {
         config,
+        full_config_id: provider
+            .filter(|_| full_config.is_some())
+            .map(|p| p.id.clone()),
+        full_config,
+        expected_live: None,
+        create_only: false,
         stamp,
         openai_route,
         catalog,
@@ -1148,7 +1174,7 @@ fn load_stash(store: &DeviceStore, official_logins: &[Value], live: Option<&Valu
     }
 }
 
-fn guarded(pre: Option<&[u8]>, then: WholeFile) -> Guarded {
+pub(super) fn guarded(pre: Option<&[u8]>, then: WholeFile) -> Guarded {
     Guarded {
         expected_pre: digest(pre),
         then,
@@ -1219,7 +1245,13 @@ pub(crate) fn run_with_edits(
         stash,
         now: chrono::Utc::now().timestamp(),
     });
-    let config_text = read_config_text();
+    let config_path = get_codex_config_path();
+    let mut base = codex_full_config::Base::read(store, &config_path)?;
+    let config_text = match &planned.full_config {
+        Some(text) => text.clone(),
+        None => String::from_utf8_lossy(base.managed(&config_path)?.as_deref().unwrap_or_default())
+            .into_owned(),
+    };
     // 目录里的官方行是按拿锁前预测的登录取的：实际的目标登录换了人（Codex 恰好重新登录、
     // settle 补完了上一次操作），就停下，什么都不写。不能换成别的来源：目录已经算进契约。
     // 钥匙串用取完官方行后读到的那次（见 `prepare_official_rows`），不在锁里读。
@@ -1269,6 +1301,9 @@ pub(crate) fn run_with_edits(
         }
     };
     let mut config = planned.config;
+    if let Some(outgoing) = base.outgoing()? {
+        config.outgoing = outgoing;
+    }
     if let Some(base_url) = planned.openai_route.filter(|_| login) {
         config.route = RouteWrite::OfficialProxy {
             base_url,
@@ -1329,7 +1364,30 @@ pub(crate) fn run_with_edits(
     }
     config_steps.push(&config);
     let config_patch = TomlSteps(config_steps);
+    let transition = base.transition(
+        &config_path,
+        planned.full_config.as_deref(),
+        planned.full_config_id.as_deref(),
+        planned.expected_live.as_deref(),
+        &config_patch,
+        &config.outgoing,
+    )?;
 
+    let config_patch = transition
+        .as_ref()
+        .map_or(&config_patch as &dyn LivePatch, |(patch, _)| patch);
+    // The file may have appeared since the first-add or background-sync check.
+    // Keep this precondition through staging and publication, including retries.
+    let create_patch;
+    let config_patch = if planned.create_only {
+        create_patch = guarded(
+            None,
+            WholeFile::Write(config_patch.apply(&config_path, None)?),
+        );
+        &create_patch
+    } else {
+        config_patch
+    };
     let mut changes: Vec<FileChange<'_>> = Vec::new();
     // auth.json 放第一个：Codex CLI 恰好在这时刷新了登录，就在发布任何文件之前停下。
     if let Some(patch) = &auth_patch {
@@ -1339,9 +1397,15 @@ pub(crate) fn run_with_edits(
         });
     }
     changes.push(FileChange {
-        file: LiveFile::private(get_codex_config_path()),
-        patch: &config_patch,
+        file: LiveFile::private(config_path),
+        patch: config_patch,
     });
+    if let Some((_, patch)) = &transition {
+        changes.push(FileChange {
+            file: LiveFile::private(&base.path),
+            patch,
+        });
+    }
     if let Some(patch) = &catalog_patch {
         changes.push(FileChange {
             file: LiveFile::shared(get_codex_model_catalog_path()),
@@ -1367,6 +1431,26 @@ pub(crate) fn run_with_edits(
     report
 }
 
+/// Initialize a missing direct configuration without replacing a file created by Codex.
+pub(super) fn initialize_direct(
+    db: &Database,
+    manager: &Arc<CodexOAuthManager>,
+    owner: Owner<'_>,
+    provider: &Provider,
+    pending: PendingTarget,
+) -> Result<OperationReport, AppError> {
+    let target = Target::Direct(Some(provider));
+    let prepared = prepare(manager, &owner, &target)?;
+    let mut planned = plan(db, &owner, &target, &prepared)?;
+    planned.create_only = true;
+    let operation = if pending.pointer.is_some() {
+        op::SWITCH
+    } else {
+        op::APPLY
+    };
+    run(db, operation, planned, &prepared, pending)
+}
+
 /// 直连写入：`prepare` → `plan` → `run`。
 pub(crate) fn write_direct(
     db: &Database,
@@ -1376,9 +1460,24 @@ pub(crate) fn write_direct(
     target: Option<&Provider>,
     pending: PendingTarget,
 ) -> Result<OperationReport, AppError> {
+    write_direct_from(db, manager, op, owner, target, pending, None)
+}
+
+/// Explicit full-file edits and switches compare again inside the write lock
+/// with the exact disk version accepted by the caller.
+pub(super) fn write_direct_from(
+    db: &Database,
+    manager: &Arc<CodexOAuthManager>,
+    op: &str,
+    owner: Owner<'_>,
+    target: Option<&Provider>,
+    pending: PendingTarget,
+    expected_live: Option<String>,
+) -> Result<OperationReport, AppError> {
     let target = Target::Direct(target);
     let prepared = prepare(manager, &owner, &target)?;
-    let planned = plan(db, &owner, &target, &prepared)?;
+    let mut planned = plan(db, &owner, &target, &prepared)?;
+    planned.expected_live = expected_live;
     run(db, op, planned, &prepared, pending)
 }
 

@@ -1,0 +1,27 @@
+{
+  "version": "4.0.36",
+  "channel": "custom",
+  "items": [
+    {
+      "type": "improve",
+      "zh": "Codex 优先使用本地配置，支持编辑完整模板",
+      "zh-TW": "Codex 優先使用本機設定，支援編輯完整範本",
+      "en": "Codex uses your local configuration and lets you edit the full template",
+      "ja": "Codex はローカル設定を優先し、テンプレート全体を編集できます"
+    },
+    {
+      "type": "fix",
+      "zh": "Codex 费用按每次请求的模型和速度档位计算",
+      "zh-TW": "Codex 費用按每次請求的模型和速度檔位計算",
+      "en": "Codex costs account for the model and speed tier of each request",
+      "ja": "Codex の費用をリクエストごとのモデルと速度設定から計算します"
+    },
+    {
+      "type": "new",
+      "zh": "魔改版可从自己的 GitHub Release 检查和安装更新",
+      "zh-TW": "自訂版可從自己的 GitHub Release 檢查並安裝更新",
+      "en": "The custom build checks its own GitHub Releases for signed updates",
+      "ja": "カスタム版専用の GitHub Releases から署名付き更新を取得できます"
+    }
+  ]
+}

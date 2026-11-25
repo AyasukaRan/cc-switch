@@ -57,6 +57,7 @@ struct ChatToResponsesState {
     completed: bool,
     response_id: String,
     model: String,
+    service_tier: Option<String>,
     created_at: u64,
     next_output_index: u32,
     text: TextItemState,
@@ -79,6 +80,7 @@ impl Default for ChatToResponsesState {
             completed: false,
             response_id: "resp_ccswitch".to_string(),
             model: String::new(),
+            service_tier: None,
             created_at: 0,
             next_output_index: 0,
             text: TextItemState::default(),
@@ -113,6 +115,9 @@ impl ChatToResponsesState {
             if !model.is_empty() {
                 self.model = model.to_string();
             }
+        }
+        if let Some(tier) = chunk.get("service_tier").and_then(Value::as_str) {
+            self.service_tier = Some(tier.to_owned());
         }
         if let Some(created) = chunk.get("created").and_then(|v| v.as_u64()) {
             self.created_at = created;
@@ -701,7 +706,7 @@ impl ChatToResponsesState {
     }
 
     fn base_response(&self, status: &str, output: Vec<Value>) -> Value {
-        json!({
+        let mut response = json!({
             "id": self.response_id,
             "object": "response",
             "created_at": self.created_at,
@@ -712,7 +717,11 @@ impl ChatToResponsesState {
                 .latest_usage
                 .clone()
                 .unwrap_or_else(|| chat_usage_to_responses_usage(None))
-        })
+        });
+        if let Some(tier) = &self.service_tier {
+            response["service_tier"] = json!(tier);
+        }
+        response
     }
 
     fn next_output_index(&mut self) -> u32 {
@@ -883,7 +892,7 @@ mod tests {
     #[tokio::test]
     async fn converts_text_chat_sse_to_responses_sse() {
         let output = collect(vec![
-            "data: {\"id\":\"chatcmpl_1\",\"created\":123,\"model\":\"gpt-5.4\",\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_1\",\"created\":123,\"model\":\"gpt-5.4\",\"service_tier\":\"flex\",\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
             "data: {\"id\":\"chatcmpl_1\",\"created\":123,\"model\":\"gpt-5.4\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6,\"prompt_tokens_details\":{\"cached_tokens\":0},\"cache_read_input_tokens\":2}}\n\n",
             "data: [DONE]\n\n",
         ])
@@ -894,6 +903,7 @@ mod tests {
             .find(|event| event["type"] == "response.completed")
             .unwrap();
 
+        assert_eq!(completed["response"]["service_tier"], "flex");
         assert!(output.contains("event: response.created"));
         assert!(output.contains("event: response.output_text.delta"));
         assert!(output.contains("\"text\":\"Hello\""));

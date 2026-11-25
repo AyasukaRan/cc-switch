@@ -2159,6 +2159,9 @@ pub(crate) fn chat_completion_to_response_with_context(
         "output": output,
         "usage": chat_usage_to_responses_usage(body.get("usage"))
     });
+    if let Some(tier) = body.get("service_tier").and_then(Value::as_str) {
+        response["service_tier"] = json!(tier);
+    }
 
     if finish_reason == Some("length") {
         response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
@@ -6814,6 +6817,7 @@ mod tests {
     #[test]
     fn chat_response_text_only_still_completes() {
         let chat = json!({
+            "service_tier": "priority",
             "id": "chatcmpl_text",
             "object": "chat.completion",
             "created": 123,
@@ -6827,6 +6831,7 @@ mod tests {
         let result =
             chat_completion_to_response_with_context(chat, &CodexToolContext::default()).unwrap();
         assert_eq!(result["status"], "completed");
+        assert_eq!(result["service_tier"], "priority");
     }
 
     #[test]

@@ -925,6 +925,11 @@
       "resumedToast": "Offizielle Anmeldung wieder aktiv. Beenden Sie Codex vollständig und öffnen Sie es erneut, damit es wirksam wird",
       "saveFailed": "Speichern fehlgeschlagen: {{error}}"
     },
+    "codexTemplate": {
+      "title": "Standard-config.toml für neue Anbieter",
+      "help": "Neue benutzerdefinierte Anbieter übernehmen die lokale config.toml. Fehlt die Datei, wird diese Vorlage verwendet. Speichern Sie eine leere Vorlage, um mit einer leeren Datei zu beginnen.",
+      "restore": "Mitgelieferte Vorlage wiederherstellen"
+    },
     "preserveCodexOfficialAuthOnSwitch": "Offizielle Anmeldung bei direkten Wechseln beibehalten",
     "preserveCodexOfficialAuthOnSwitchDescription": "Steuert Wechsel zu Drittanbietern, wenn das lokale Routing ausgeschaltet ist. Die Routing-Übernahme behält die offizielle Codex-Anmeldung immer bei.",
     "unifyCodexSessionHistory": "Einheitlicher Codex-Sitzungsverlauf",
@@ -1009,7 +1014,7 @@
     "upToDate": "Auf dem neuesten Stand",
     "aboutHint": "Versionsinformationen und Update-Status anzeigen.",
     "portableMode": "Portabler Modus: Updates müssen manuell heruntergeladen werden.",
-    "portableUpdateHint": "Portabler Modus: Die Schaltfläche oben lädt das neue ZIP herunter. Entpacken Sie es und ersetzen Sie Ihre vorhandene cc-switch.exe. Ihre Einstellungen und Daten liegen in .cc-switch in Ihrem Benutzerordner und sind nicht betroffen.",
+    "portableUpdateHint": "Auf der Release-Seite der angepassten Version sehen Sie, welche portablen Pakete verfügbar sind.",
     "updateAvailable": "Neue Version verfügbar: {{version}}",
     "updateBadge": "Update verfügbar",
     "updateFailed": "Die Update-Installation ist fehlgeschlagen, es wurde versucht, die Download-Seite zu öffnen.",
@@ -2160,6 +2165,8 @@
     "empty": "Keine Endpunkte"
   },
   "codexConfig": {
+    "fullConfig": "Vollständige config.toml verwenden",
+    "fullConfigHint": "Wenn Sie im Direktmodus zu diesem Anbieter wechseln, wird seine config.toml angewendet. Speichern Sie Änderungen am aktiven Direktanbieter, wird die lokale Datei sofort aktualisiert. Beim Hinzufügen eines Anbieters oder Bearbeiten einer inaktiven vollständigen Konfiguration werden Änderungen nur in der Karte gespeichert. Konfigurieren Sie die Drittanbieter-Authentifizierung in der Datei, etwa mit env_key. Im Routing- und Aggregationsmodus gelten die Routing-Einstellungen von CC Switch.",
     "authJson": "auth.json (JSON) *",
     "authJsonPlaceholder": "{\n  \"OPENAI_API_KEY\": \"sk-your-api-key-here\"\n}",
     "authJsonHint": "Inhalt der Codex-Konfiguration auth.json",
@@ -2493,6 +2500,7 @@
     "noPricingData": "Keine Preisdaten. Klicken Sie auf „Hinzufügen“, um eine Modellpreis-Konfiguration anzulegen.",
     "model": "Modell",
     "pricingModel": "Preismodell",
+    "serviceTier": "Dienststufe",
     "displayName": "Anzeigename",
     "inputCost": "Eingabekosten",
     "outputCost": "Ausgabekosten",

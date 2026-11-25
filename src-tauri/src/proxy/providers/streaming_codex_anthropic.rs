@@ -111,7 +111,7 @@ impl AnthropicToResponsesState {
     }
 
     fn base_response(&self, status: &str, output: Vec<Value>) -> Value {
-        json!({
+        let mut response = json!({
             "id": self.response_id,
             "object": "response",
             "created_at": 0,
@@ -119,7 +119,15 @@ impl AnthropicToResponsesState {
             "model": self.model,
             "output": output,
             "usage": self.responses_usage()
-        })
+        });
+        if let Some(tier) = self
+            .anthropic_usage
+            .get("service_tier")
+            .and_then(Value::as_str)
+        {
+            response["service_tier"] = json!(tier);
+        }
+        response
     }
 
     fn merge_usage(&mut self, usage: &Value) {
@@ -888,12 +896,13 @@ mod tests {
             "model": "claude",
             "content": [{ "type": "text", "text": "Hello" }],
             "stop_reason": "end_turn",
-            "usage": { "input_tokens": 4, "output_tokens": 2 }
+            "usage": { "service_tier": "standard", "input_tokens": 4, "output_tokens": 2 }
         }));
         assert!(merged.contains("event: response.created"));
         assert!(merged.contains("event: response.output_text.delta"));
         assert!(merged.contains("\"delta\":\"Hello\""));
         assert!(merged.contains("event: response.completed"));
+        assert!(merged.contains("\"service_tier\":\"standard\""));
         assert!(merged.contains("\"status\":\"completed\""));
         assert!(!merged.contains("event: response.failed"));
     }

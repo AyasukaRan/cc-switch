@@ -245,6 +245,7 @@ impl Database {
             request_id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, app_type TEXT NOT NULL, model TEXT NOT NULL,
             request_model TEXT,
             pricing_model TEXT,
+            service_tier TEXT,
             input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
             cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
             input_token_semantics INTEGER NOT NULL DEFAULT 0,
@@ -744,6 +745,10 @@ impl Database {
                             Self::add_column_if_missing(conn, "skills", "repo_host", "TEXT")?;
                         }
                         Self::set_user_version(conn, 27)?;
+                    }
+                    27 => {
+                        Self::migrate_v27_to_v28(conn)?;
+                        Self::set_user_version(conn, 28)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -2000,14 +2005,14 @@ impl Database {
             ),
             // GPT-6 系列（Astra 2026-09-04 发布，1.05M 窗口；Sol / Luna 2026-09-22 发布）
             // 2026-09-23 核对官方价页 + 模型页 + models.dev：录入 Standard 短上下文价，
-            // cache read 0.1×、cache write 1.25× 输入价。>272K 长上下文档（输入与缓存 2×、输出 1.5×）、
-            // Batch/Flex、Fast mode、区域加价本表无法表达，与 gpt-5.5 同样忽略。
+            // cache read 0.1×、cache write 1.25× 输入价。表内未区分 >272K 长上下文及区域加价。
+            // Codex 的速度档位由计费器按请求单独计算。
             // effort 档 low/medium/high/xhigh 由查价剥后缀回落到本行；max 不在剥离列表
             //（会与 *-max 真 id 撞名），不另加后缀行。
             ("gpt-6-astra", "GPT-6 Astra", "10", "50", "1", "12.5"),
             // GPT-6.2 Sol / Astra（2026-11-17 发布）：2026-11-17 核对官方模型页 + 价页 + models.dev，
             // 取 Standard ≤272K 短上下文价，cache write 取 30 分钟档（12 小时档为 2 倍）。
-            // 长上下文档、Batch/Fast/Ultrafast 与 astra-law 配置本表无法表达，同 GPT-6 一样忽略。
+            // Codex 的速度档位由计费器按请求单独计算。此表不区分长上下文、Batch 或 astra-law。
             // https://developers.openai.com/api/docs/models/gpt-6.2-sol
             // https://developers.openai.com/api/docs/models/gpt-6.2-astra
             ("gpt-6.2-sol", "GPT-6.2 Sol", "2", "10", "0.10", "2.50"),
@@ -4052,6 +4057,52 @@ impl Database {
         Ok(false)
     }
 
+    /// Negative byte offsets mark a migrated cursor waiting for its first tier-aware scan.
+    pub(crate) fn codex_tier_migration_pending(&self) -> Result<bool, AppError> {
+        let conn = lock_conn!(self.conn);
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_log_sync WHERE last_byte_offset = -1)",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn finish_codex_tier_migration_scan(&self) -> Result<(), AppError> {
+        let conn = lock_conn!(self.conn);
+        // Files that have moved or are unavailable still need replay if they return.
+        // NULL triggers that replay without delaying maintenance on every later startup.
+        conn.execute(
+            "UPDATE session_log_sync SET last_byte_offset = NULL WHERE last_byte_offset = -1",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn migrate_v27_to_v28(conn: &Connection) -> Result<(), AppError> {
+        if !Self::table_exists(conn, "proxy_request_logs")? {
+            return Ok(());
+        }
+        Self::add_column_if_missing(conn, "proxy_request_logs", "service_tier", "TEXT")?;
+        if Self::has_column(conn, "session_log_sync", "last_byte_offset")?
+            && Self::has_column(conn, "proxy_request_logs", "data_source")?
+        {
+            // Only revisit files with surviving request details. Keep the line cursor: a
+            // replay may update old requests but must never recreate a pruned/rolled-up row.
+            conn.execute(
+                "UPDATE session_log_sync SET last_byte_offset = -1
+                 WHERE instr(replace(file_path, char(92), '/'), '/rollout-') > 0
+                   AND CASE WHEN file_path LIKE '%.jsonl.zst' THEN lower(substr(file_path, -36 - length('.jsonl.zst'), 36))
+                            WHEN file_path LIKE '%.jsonl' THEN lower(substr(file_path, -36 - length('.jsonl'), 36)) END
+                       IN (SELECT substr(request_id, length('codex_session:thread-v1:') + 1, 36)
+                           FROM proxy_request_logs
+                           WHERE data_source = 'codex_session' AND service_tier IS NULL
+                             AND request_id GLOB 'codex_session:thread-v1:*')",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
     fn add_column_if_missing(
         conn: &Connection,
         table: &str,
@@ -4081,6 +4132,89 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrate_codex_tiers_revisits_only_cursors_with_retained_details() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        let kept = "10000000-0000-4000-b000-000000000001";
+        let rolled_up = "10000000-0000-4000-b000-000000000002";
+        conn.execute_batch(
+            "CREATE TABLE proxy_request_logs(request_id TEXT PRIMARY KEY, data_source TEXT, total_cost_usd TEXT);
+             CREATE TABLE session_log_sync(file_path TEXT PRIMARY KEY, last_line_offset INTEGER, last_byte_offset INTEGER);
+             CREATE TABLE usage_daily_rollups(request_count INTEGER, total_cost_usd TEXT);
+             INSERT INTO usage_daily_rollups VALUES (3, '42');"
+        )?;
+        conn.execute(
+            "INSERT INTO proxy_request_logs VALUES (?1, 'codex_session', '9')",
+            [format!("codex_session:thread-v1:{kept}:1")],
+        )?;
+        for id in [kept, rolled_up] {
+            for suffix in [".jsonl", ".jsonl.zst"] {
+                conn.execute(
+                    "INSERT INTO session_log_sync VALUES (?1, 15, 500)",
+                    [format!("/sessions/rollout-2026-11-18-{id}{suffix}")],
+                )?;
+            }
+        }
+        Database::set_user_version(&conn, 27)?;
+        Database::apply_schema_migrations_on_conn(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT file_path, last_line_offset, last_byte_offset FROM session_log_sync",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            assert_eq!(row.get::<_, i64>(1)?, 15);
+            assert_eq!(
+                row.get::<_, Option<i64>>(2)?,
+                Some(if path.contains(kept) { -1 } else { 500 })
+            );
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT service_tier, total_cost_usd FROM proxy_request_logs",
+                [],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?))
+            )?,
+            (None, "9".into())
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT request_count, total_cost_usd FROM usage_daily_rollups",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            )?,
+            (3, "42".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn codex_tier_migration_only_delays_first_scan() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        assert!(!db.codex_tier_migration_pending()?);
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO session_log_sync(file_path,last_modified,last_synced_at,
+                    last_line_offset,last_byte_offset) VALUES ('missing-rollout',1,2,12,-1)",
+                [],
+            )?;
+        }
+        assert!(db.codex_tier_migration_pending()?);
+        db.finish_codex_tier_migration_scan()?;
+        assert!(!db.codex_tier_migration_pending()?);
+        let conn = lock_conn!(db.conn);
+        assert_eq!(
+            conn.query_row(
+                "SELECT last_line_offset, last_byte_offset FROM session_log_sync",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
+            )?,
+            (12, None)
+        );
+        Ok(())
+    }
 
     #[test]
     fn migrate_v23_to_v24_preserves_existing_session_cursors() -> Result<(), AppError> {

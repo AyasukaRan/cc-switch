@@ -87,6 +87,18 @@ describe("RequestDetailPanel", () => {
     expect(screen.getByText("usage.detail.speedTooFew")).toBeInTheDocument();
   });
 
+  it("shows the recorded Codex service tier beside the model", () => {
+    renderWith(
+      log({
+        appType: "codex",
+        model: "gpt-6.2-astra",
+        serviceTier: "ultrafast",
+      }),
+    );
+    expect(screen.getByText("usage.serviceTier")).toBeInTheDocument();
+    expect(screen.getByText("ultrafast")).toBeInTheDocument();
+  });
+
   it("shows an estimated speed and duration for session logs", () => {
     renderWith(
       log({

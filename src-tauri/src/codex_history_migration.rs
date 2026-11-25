@@ -862,6 +862,7 @@ fn migrate_codex_provider_templates_to_custom(
 
     for (_, provider) in providers {
         if provider.has_official_category()
+            || provider.uses_codex_full_config()
             || is_official_seed_id(&provider.id)
             || provider.is_codex_oauth()
         {
@@ -907,6 +908,7 @@ fn collect_source_model_provider_ids(db: &Database) -> Result<BTreeSet<String>, 
 
     for provider in providers.values() {
         if provider.has_official_category()
+            || provider.uses_codex_full_config()
             || is_official_seed_id(&provider.id)
             || provider.is_codex_oauth()
         {
@@ -2628,6 +2630,33 @@ model_provider = "my-private-relay"
         assert!(ids.contains("ccswitch"));
         assert!(ids.contains("aihubmix"));
         assert!(!ids.contains("generated-uuid"));
+    }
+
+    #[test]
+    fn codex_full_config_keeps_its_own_provider_and_history_ids() {
+        let db = Database::memory().unwrap();
+        let text = "# user's route\r\nmodel_provider = 'aihubmix'\r\n[model_providers.aihubmix]\r\nenv_key = 'RELAY_KEY'\r\n";
+        let mut provider = Provider::with_id(
+            "default".into(),
+            "Default".into(),
+            serde_json::json!({"auth": {}, "config": text}),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            codex_full_config: Some(true),
+            ..Default::default()
+        });
+        db.save_provider(&AppType::Codex, &provider).unwrap();
+        assert!(collect_source_model_provider_ids(&db).unwrap().is_empty());
+        let (outcome, _) = migrate_provider_templates_for_test(&db);
+        assert!(outcome.migrated_provider_ids.is_empty());
+        assert_eq!(
+            db.get_provider_by_id("default", &AppType::Codex)
+                .unwrap()
+                .unwrap()
+                .settings_config["config"],
+            text
+        );
     }
 
     #[test]

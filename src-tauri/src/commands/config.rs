@@ -11,6 +11,29 @@ use crate::store::AppState;
 
 use std::str::FromStr;
 
+/// Read only the TOML for a new custom provider. A running proxy owns its
+/// temporary client configuration, which cannot be reused as an upstream.
+#[tauri::command]
+pub async fn get_codex_local_config(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let app = AppType::Codex;
+    let _guard = state.proxy_service.lock_switch_for_app(app.as_str()).await;
+    let mode = crate::mode::state::mode_state(
+        &crate::live::engine::DeviceStore::for_device(),
+        app.as_str(),
+    )
+    .map_err(|e| e.to_string())?;
+    if mode.attached {
+        return Ok(None);
+    }
+    let config = codex_config::read_optional_codex_config_text().map_err(|e| e.to_string())?;
+    Ok(config.filter(|text| {
+        !codex_config::codex_config_has_official_proxy_route(text)
+            && !crate::services::provider::codex_direct::routes_official_to_proxy(&state.db, text)
+            && codex_config::extract_codex_experimental_bearer_token(text).as_deref()
+                != Some(crate::live::project::claude::PROXY_TOKEN_PLACEHOLDER)
+    }))
+}
+
 #[tauri::command]
 pub async fn get_config_status(
     state: State<'_, AppState>,
@@ -30,8 +53,10 @@ pub async fn get_config_status(
         }
         AppType::Codex => {
             let auth_path = codex_config::get_codex_auth_path();
-            let config_text = codex_config::read_codex_config_text().unwrap_or_default();
-            let exists = auth_path.exists() || !config_text.trim().is_empty();
+            let exists = auth_path.exists()
+                || codex_config::get_codex_config_path()
+                    .try_exists()
+                    .map_err(|e| e.to_string())?;
             let path = codex_config::get_codex_config_dir()
                 .to_string_lossy()
                 .to_string();

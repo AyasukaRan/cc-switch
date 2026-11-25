@@ -89,41 +89,35 @@ pub async fn copy_text_to_clipboard(text: String) -> Result<bool, String> {
 pub async fn check_for_updates(handle: AppHandle) -> Result<bool, String> {
     handle
         .opener()
-        .open_url(
-            "https://github.com/farion1231/cc-switch/releases/latest",
-            None::<String>,
-        )
+        .open_url(custom_release_url(""), None::<String>)
         .map_err(|e| format!("打开更新页面失败: {e}"))?;
 
     Ok(true)
 }
 
-/// 便携版新版本压缩包的下载地址，命名与 release.yml 的「Prepare Windows Assets」一致：
-/// `CC-Switch-v<版本>-Windows[-arm64]-Portable.zip`。版本号不像版本号时返回 None。
-fn portable_zip_url(version: &str, arm64: bool) -> Option<String> {
-    let version = version.trim().trim_start_matches('v');
+/// 魔改版的发布页只列出当次发布实际提供的平台包。
+fn custom_release_url(version: &str) -> String {
+    const RELEASES: &str = "https://github.com/AyasukaRan/cc-switch/releases";
+    let version = version.trim();
+    let version = version.strip_prefix('v').unwrap_or(version);
     let looks_like_version = version.starts_with(|c: char| c.is_ascii_digit())
         && version
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
-    if !looks_like_version {
-        return None;
+    if looks_like_version {
+        format!("{RELEASES}/tag/custom-v{version}")
+    } else {
+        format!("{RELEASES}/latest")
     }
-    let suffix = if arm64 { "-arm64" } else { "" };
-    Some(format!(
-        "https://github.com/farion1231/cc-switch/releases/download/v{version}/CC-Switch-v{version}-Windows{suffix}-Portable.zip"
-    ))
 }
 
-/// 便携版更新：直接下载对应架构的新版压缩包（解压覆盖即可，数据在 ~/.cc-switch 不受影响）。
-/// 不做原地替换自身 exe：那样很容易被杀毒软件当成病毒拦截。
+/// 便携版更新：打开对应版本的发布页，供用户手动下载。
 #[tauri::command]
 pub async fn open_portable_update_download(
     handle: AppHandle,
     version: String,
 ) -> Result<bool, String> {
-    let url = portable_zip_url(&version, cfg!(target_arch = "aarch64"))
-        .unwrap_or_else(|| "https://github.com/farion1231/cc-switch/releases/latest".to_string());
+    let url = custom_release_url(&version);
     handle
         .opener()
         .open_url(url, None::<String>)
@@ -1089,17 +1083,20 @@ mod tests {
     }
 
     #[test]
-    fn portable_zip_url_matches_release_asset_names() {
+    fn manual_update_targets_the_custom_release() {
         assert_eq!(
-            portable_zip_url("4.0.12", false).as_deref(),
-            Some("https://github.com/farion1231/cc-switch/releases/download/v4.0.12/CC-Switch-v4.0.12-Windows-Portable.zip")
+            custom_release_url("4.0.36"),
+            "https://github.com/AyasukaRan/cc-switch/releases/tag/custom-v4.0.36"
         );
         assert_eq!(
-            portable_zip_url("v4.1.0-beta.1", true).as_deref(),
-            Some("https://github.com/farion1231/cc-switch/releases/download/v4.1.0-beta.1/CC-Switch-v4.1.0-beta.1-Windows-arm64-Portable.zip")
+            custom_release_url("v4.1.0-beta.1"),
+            "https://github.com/AyasukaRan/cc-switch/releases/tag/custom-v4.1.0-beta.1"
         );
         for bad in ["", "v", "latest", "4.0/../x", "4.0.0?x=1"] {
-            assert!(portable_zip_url(bad, false).is_none(), "{bad}");
+            assert_eq!(
+                custom_release_url(bad),
+                "https://github.com/AyasukaRan/cc-switch/releases/latest"
+            );
         }
     }
 

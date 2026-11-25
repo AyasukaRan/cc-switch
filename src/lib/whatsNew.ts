@@ -18,6 +18,7 @@ export type WhatsNewItem = { type: WhatsNewItemType } & Record<
 
 export interface WhatsNewEntry {
   version: string;
+  channel?: "custom";
   /** 空数组 = 这一版不弹窗（纯构建、CI 之类的版本） */
   items: WhatsNewItem[];
 }
@@ -28,9 +29,9 @@ const modules = import.meta.glob<WhatsNewEntry>("../whats-new/*.json", {
 });
 
 /** 所有版本的摘要，新到旧 */
-export const WHATS_NEW_ENTRIES: WhatsNewEntry[] = Object.values(modules).sort(
-  (a, b) => compareVersions(b.version, a.version),
-);
+export const WHATS_NEW_ENTRIES: WhatsNewEntry[] = Object.values(modules)
+  .filter((entry) => entry.channel === "custom")
+  .sort((a, b) => compareVersions(b.version, a.version));
 
 /** 当前版本比记录的已看版本新（或从没记录过）：需要处理一次 */
 export function isNewerThanSeen(
@@ -86,14 +87,4 @@ export function resolveWhatsNewLanguage(language: string): WhatsNewLanguage {
   return (WHATS_NEW_LANGUAGES as readonly string[]).includes(language)
     ? (language as WhatsNewLanguage)
     : "en";
-}
-
-/** 官网更新日志：不带版本是列表页。官网只有 zh / en / ja，繁中用简中页面 */
-export function changelogUrl(
-  language: WhatsNewLanguage,
-  version?: string,
-): string {
-  const siteLanguage = language === "zh-TW" ? "zh" : language;
-  const base = `https://ccswitch.io/${siteLanguage}/changelog`;
-  return version ? `${base}/${version}` : base;
 }

@@ -1454,7 +1454,24 @@ pub fn run() {
                 // The first interval tick runs startup maintenance; later ticks
                 // run daily, without a catch-up burst after sleep.
                 let db_for_timer = state.db.clone();
+                let (session_scan_finished, after_session_scan) = tokio::sync::oneshot::channel();
                 tauri::async_runtime::spawn(async move {
+                    // A v27 upgrade may still have old details that can be repriced from
+                    // local rollouts. Give the first scan a chance before pruning them.
+                    let db = db_for_timer.clone();
+                    let migration_pending = tauri::async_runtime::spawn_blocking(move || {
+                        db.codex_tier_migration_pending()
+                    }).await;
+                    if matches!(migration_pending, Ok(Ok(true))) {
+                        let _ = after_session_scan.await;
+                        let db = db_for_timer.clone();
+                        let finished = tauri::async_runtime::spawn_blocking(move || {
+                            db.finish_codex_tier_migration_scan()
+                        }).await;
+                        if let Ok(Err(e)) = finished {
+                            log::warn!("Finishing Codex tier migration scan failed: {e}");
+                        }
+                    }
                     const PERIODIC_MAINTENANCE_INTERVAL_SECS: u64 = 24 * 60 * 60;
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                         PERIODIC_MAINTENANCE_INTERVAL_SECS,
@@ -1511,6 +1528,7 @@ pub fn run() {
 
                     // 首次同步（含费用回填）
                     run_session_sync(db_for_session_sync.clone(), true).await;
+                    let _ = session_scan_finished.send(());
 
                     // 定期同步
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -1599,6 +1617,7 @@ pub fn run() {
             commands::ensure_claude_desktop_official_provider,
             commands::ensure_grokbuild_official_provider,
             commands::get_config_status,
+            commands::get_codex_local_config,
             commands::get_config_dir,
             commands::open_config_folder,
             commands::pick_directory,

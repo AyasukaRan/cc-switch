@@ -288,12 +288,18 @@ async fn copilot_success_bookkeeping_preserves_actual_upstream_format() {
                 &provider,
                 &AppType::Codex,
                 false,
-                (response, None, Some("resolved-model".to_string())),
+                (
+                    response,
+                    None,
+                    Some("resolved-model".to_string()),
+                    Some("flex".into()),
+                ),
                 format,
             )
             .await;
 
         assert_eq!(result.codex_upstream_format, format);
+        assert_eq!(result.outbound_service_tier.as_deref(), Some("flex"));
         assert_eq!(result.outbound_model.as_deref(), Some("resolved-model"));
         assert_eq!(result.provider.id, provider.id);
         assert_eq!(result.response.status(), StatusCode::OK);

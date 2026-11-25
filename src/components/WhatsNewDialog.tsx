@@ -14,10 +14,10 @@ import {
 import { Button } from "@/components/ui/button";
 import { useNewLayoutNoticePending } from "@/components/shell/NewLayoutDialog";
 import { settingsApi } from "@/lib/api";
+import { releaseNotesUrl } from "@/lib/releaseLinks";
 import { useSettingsQuery } from "@/lib/query";
 import {
   WHATS_NEW_ENTRIES,
-  changelogUrl,
   entriesSince,
   isNewerThanSeen,
   markSeen,
@@ -62,10 +62,7 @@ export function WhatsNewDialog({
   const handleViewFull = () => {
     // 只有一个版本就直接打开这一版，多个版本打开更新日志列表
     openExternal(
-      changelogUrl(
-        language,
-        entries.length === 1 ? entries[0].version : undefined,
-      ),
+      releaseNotesUrl(entries.length === 1 ? entries[0].version : undefined),
     );
     onClose();
   };
@@ -107,9 +104,7 @@ export function WhatsNewDialog({
                 <button
                   type="button"
                   className="inline-flex items-center gap-1 text-caption text-fg-2 hover:text-fg-1"
-                  onClick={() =>
-                    openExternal(changelogUrl(language, entry.version))
-                  }
+                  onClick={() => openExternal(releaseNotesUrl(entry.version))}
                 >
                   {t("whatsNew.versionDetails")}
                   <ExternalLink className="h-3 w-3" />

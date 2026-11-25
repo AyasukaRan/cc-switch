@@ -925,6 +925,11 @@
       "resumedToast": "공식 로그인 사용을 재개했습니다. Codex를 완전히 종료하고 다시 실행하면 적용됩니다.",
       "saveFailed": "저장하지 못했습니다: {{error}}"
     },
+    "codexTemplate": {
+      "title": "새 공급자의 기본 config.toml",
+      "help": "새 사용자 지정 공급자는 로컬 config.toml을 사용합니다. 로컬 파일이 없을 때 이 템플릿을 사용합니다. 빈 파일로 시작하려면 템플릿을 비워 저장하세요.",
+      "restore": "기본 제공 템플릿 복원"
+    },
     "preserveCodexOfficialAuthOnSwitch": "직접 연결 전환 시 공식 로그인 유지",
     "preserveCodexOfficialAuthOnSwitchDescription": "라우팅이 앱 설정을 관리하지 않는 상태에서 타사 공급자로 전환할 때 Codex 공식 로그인을 유지할지 정합니다. 라우팅이 앱 설정을 관리하는 동안에는 항상 공식 로그인을 유지합니다.",
     "unifyCodexSessionHistory": "Codex 세션 기록 통합",
@@ -1009,7 +1014,7 @@
     "upToDate": "최신",
     "aboutHint": "버전 정보 및 업데이트 상태를 확인하세요.",
     "portableMode": "포터블 모드: 업데이트를 수동으로 다운로드해야 합니다.",
-    "portableUpdateHint": "포터블 모드에서는 위 버튼을 누르면 새 ZIP 파일을 다운로드합니다. 압축을 풀고 기존 cc-switch.exe를 교체하세요. 설정과 데이터는 사용자 폴더의 .cc-switch에 저장되며 영향을 받지 않습니다.",
+    "portableUpdateHint": "위 버튼을 눌러 커스텀 릴리스 페이지에서 이 버전의 포터블 패키지를 확인하세요.",
     "updateAvailable": "새 버전 사용 가능: {{version}}",
     "updateBadge": "업데이트 가능",
     "updateFailed": "업데이트 설치에 실패했습니다. 다운로드 페이지를 열려고 했습니다.",
@@ -2160,6 +2165,8 @@
     "empty": "엔드포인트 없음"
   },
   "codexConfig": {
+    "fullConfig": "전체 config.toml 사용",
+    "fullConfigHint": "직접 연결 모드에서 이 공급자로 전환하면 저장된 config.toml이 적용됩니다. 현재 사용 중인 직접 연결 공급자의 편집 내용을 저장하면 로컬 파일이 즉시 업데이트됩니다. 공급자를 추가하거나 사용하지 않는 전체 설정을 편집하면 카드에만 저장됩니다. 파일 안에서 env_key 등을 사용해 타사 인증을 구성하세요. 라우팅 모드와 집계 모드에서는 CC Switch의 라우팅 설정을 사용합니다.",
     "authJson": "auth.json (JSON) *",
     "authJsonPlaceholder": "{\n  \"OPENAI_API_KEY\": \"sk-your-api-key-here\"\n}",
     "authJsonHint": "Codex auth.json 설정 내용",
@@ -2488,6 +2495,7 @@
     "noPricingData": "요금 데이터가 없습니다. 모델 요금 설정을 추가하려면 \"추가\"를 클릭하세요.",
     "model": "모델",
     "pricingModel": "요금 기준 모델",
+    "serviceTier": "서비스 등급",
     "displayName": "표시 이름",
     "inputCost": "입력 비용",
     "outputCost": "출력 비용",

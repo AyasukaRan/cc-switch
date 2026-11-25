@@ -77,9 +77,18 @@ pub(crate) fn terminal_launch(
     };
     let current = current::provider_for(db, &AppType::Codex, purpose)?.as_deref()
         == Some(provider.id.as_str());
+    let full_config = provider.uses_codex_full_config();
+    if full_config && !current {
+        return Err(AppError::localized(
+            "codex.terminal.full_config",
+            "请先切换到这个供应商，再打开终端以加载它的完整 config.toml。",
+            "Switch to this provider before opening a terminal to load its complete config.toml.",
+        ));
+    }
     // 直连下当前那家就是 live；路由下跟着登录走的卡也只能经路由用，直接跑 `codex`。
     let plain = current
-        && (!proxy
+        && (full_config
+            || !proxy
             || matches!(
                 codex_direct::project(provider)?.route,
                 Route::Official | Route::Default

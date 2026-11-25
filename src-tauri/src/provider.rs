@@ -130,6 +130,18 @@ impl Provider {
         self.is_xai_oauth() || self.is_github_copilot()
     }
 
+    pub fn uses_codex_full_config(&self) -> bool {
+        self.meta.as_ref().is_some_and(|meta| {
+            meta.codex_full_config == Some(true)
+                && !meta
+                    .auth_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.source == AuthBindingSource::ManagedAccount)
+        }) && !self.has_official_category()
+            && !self.uses_managed_account_auth()
+            && !crate::proxy::providers::is_codex_official_provider(self)
+    }
+
     /// Whether the provider form's "auth field" was explicitly set to
     /// ANTHROPIC_API_KEY. The form only persists `meta.apiKeyField` for the
     /// non-default choice, so `None` means the default ANTHROPIC_AUTH_TOKEN.
@@ -632,6 +644,9 @@ pub struct ProviderMeta {
     /// Codex OAuth FAST mode: inject `service_tier = "priority"` for ChatGPT Codex requests.
     #[serde(rename = "codexFastMode", skip_serializing_if = "Option::is_none")]
     pub codex_fast_mode: Option<bool>,
+    /// Write this provider's config.toml verbatim on direct switches.
+    #[serde(rename = "codexFullConfig", skip_serializing_if = "Option::is_none")]
+    pub codex_full_config: Option<bool>,
     /// Codex Responses -> Chat Completions reasoning capability metadata.
     #[serde(rename = "codexChatReasoning", skip_serializing_if = "Option::is_none")]
     pub codex_chat_reasoning: Option<CodexChatReasoningConfig>,

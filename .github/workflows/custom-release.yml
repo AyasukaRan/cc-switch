@@ -1,0 +1,97 @@
+name: Publish CC Switch Custom for Apple Silicon
+
+on:
+  push:
+    tags:
+      - 'custom-v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-custom-macos
+  queue: max
+
+jobs:
+  release:
+    if: github.repository == 'AyasukaRan/cc-switch' && !github.event.deleted
+    runs-on: macos-15
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release branch and version
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor HEAD refs/remotes/origin/feat/ran
+          [[ "$TAG" =~ ^custom-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          version=${TAG#custom-v}
+          for file in package.json src-tauri/tauri.conf.json "src/whats-new/$version.json"; do
+            jq -e --arg version "$version" '.version == $version' "$file" >/dev/null
+          done
+          cargo metadata --manifest-path src-tauri/Cargo.toml --locked --no-deps --format-version 1 |
+            jq -e --arg version "$version" 'any(.packages[]; .name == "cc-switch" and .version == $version)'
+
+      - name: Check existing releases
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          list="$RUNNER_TEMP/custom-releases.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$list"
+          state=$(jq -r --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)] | if length == 0 then "new" elif .[0].draft then "draft" else "published" end' "$list")
+          latest=$(jq -r --arg tag "$TAG" '([.[][] | select(.draft == false and .prerelease == false) | .tag_name | select(test("^custom-v[0-9]+\\.[0-9]+\\.[0-9]+$"))] + [$tag]) | max_by(ltrimstr("custom-v") | split(".") | map(tonumber)) == $tag' "$list")
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v6
+        if: steps.release.outputs.state != 'published'
+        with:
+          node-version-file: .node-version
+
+      - name: Install tools and check release notes
+        if: steps.release.outputs.state != 'published'
+        run: |
+          set -euo pipefail
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm exec vitest run tests/config/whatsNewEntries.test.ts
+          brew list --versions minisign >/dev/null || brew install minisign
+
+      - name: Build and sign the updater payload
+        if: steps.release.outputs.state != 'published'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.CUSTOM_TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.CUSTOM_TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${TAURI_SIGNING_PRIVATE_KEY:?Missing custom updater signing key}"
+          pnpm tauri build --ci --target aarch64-apple-darwin --bundles app --config '{"bundle":{"macOS":{"signingIdentity":"-"}}}'
+
+      - name: Prepare verified Apple Silicon downloads
+        if: steps.release.outputs.state != 'published'
+        run: bash scripts/package-custom-macos.sh "$TAG" src-tauri/target/aarch64-apple-darwin/release/bundle/macos "$RUNNER_TEMP/release-assets"
+
+      - name: Publish complete release
+        if: steps.release.outputs.state != 'published'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          STATE: ${{ steps.release.outputs.state }}
+          LATEST: ${{ steps.release.outputs.latest }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/custom-release-notes.md"
+          printf 'CC Switch 魔改版，适用于 Apple Silicon Mac。下载 zip，解压后将应用拖入「应用程序」。此构建使用本地签名，未经 Apple 公证。\n\n' > "$notes"
+          jq -r '.items[] | "- " + .zh' "src/whats-new/${TAG#custom-v}.json" >> "$notes"
+          if [[ "$STATE" == new ]]; then
+            gh release create "$TAG" --draft --verify-tag --title "CC Switch Custom $TAG" --notes-file "$notes"
+          fi
+          gh release upload "$TAG" "$RUNNER_TEMP/release-assets/"* --clobber
+          gh release edit "$TAG" --draft=false --prerelease=false --latest="$LATEST" --notes-file "$notes"

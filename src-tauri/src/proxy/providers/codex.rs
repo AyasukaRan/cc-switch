@@ -267,7 +267,7 @@ pub fn provider_needs_responses_late_arguments_repair(provider: &Provider) -> bo
     !is_codex_official_provider(provider)
 }
 
-fn has_explicit_codex_third_party_upstream(provider: &Provider) -> bool {
+pub(crate) fn has_explicit_codex_third_party_upstream(provider: &Provider) -> bool {
     let non_empty_setting = |key: &str| {
         provider
             .settings_config

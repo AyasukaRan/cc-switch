@@ -8,7 +8,7 @@ import {
 } from "react";
 import { useForm, useWatch, type Control } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { toast } from "@/lib/toast";
 import { Button } from "@/components/ui/button";
@@ -20,13 +20,17 @@ import {
   formatRequestOverrideObject,
 } from "@/lib/requestOverrides";
 import { providersApi, type AppId, type AuthCenterTarget } from "@/lib/api";
-import type { ProviderEditorInactiveField } from "@/lib/api/providers";
+import type {
+  ProviderEditorInactiveField,
+  ProviderEditorView,
+} from "@/lib/api/providers";
 import {
   overlayClaudeProviderFields,
   withClaudeGatewayDefaults,
 } from "@/utils/claudeEditorOverlay";
 import { useDarkMode } from "@/hooks/useDarkMode";
 import type {
+  Settings,
   ProviderCategory,
   ProviderMeta,
   ClaudeApiFormat,
@@ -110,6 +114,7 @@ import {
 } from "./ClaudeStackModelsField";
 import { setClaudeOneMMarker } from "./hooks/useModelState";
 import { useAppMode } from "@/lib/query/proxy";
+import { useSettingsQuery } from "@/lib/query";
 import { ClaudeDesktopProviderForm } from "./ClaudeDesktopProviderForm";
 import { GrokBuildProviderForm } from "./GrokBuildProviderForm";
 import { CodexFormFields } from "./CodexFormFields";
@@ -166,6 +171,7 @@ import { useHermesLiveProviderIds } from "@/hooks/useHermes";
 import { resolveCodexOfficialIdentity } from "@/utils/providerCapabilities";
 import { normalizeEnabledCodexChatEffortParam } from "./helpers/codexChatReasoning";
 import { appHas } from "@/config/appSpecs";
+import { extractErrorMessage } from "@/utils/errorUtils";
 
 type PresetEntry = {
   id: string;
@@ -328,6 +334,8 @@ export interface ProviderFormProps {
     icon?: string;
     iconColor?: string;
   };
+  /** Original provider TOML, before overlaying live global settings for the guided form. */
+  storedCodexConfig?: string;
   showButtons?: boolean;
   isProxyTakeover?: boolean;
   /** 编辑器里行保存着、但不随切换生效的字段（Claude Code、Codex、Gemini CLI、Grok Build）。 */
@@ -381,7 +389,26 @@ export function ProviderForm(props: ProviderFormProps) {
     return <GrokBuildProviderForm {...props} />;
   }
 
+  if (props.appId === "codex" && !props.initialData) {
+    return <NewCodexProviderForm {...props} />;
+  }
   return <ProviderFormFull {...props} />;
+}
+
+function NewCodexProviderForm(props: ProviderFormProps) {
+  const settings = useSettingsQuery();
+  const client = useQueryClient();
+  const getCustomTemplate = useCallback(
+    () => client.getQueryData<Settings>(["settings"])?.codexCustomTemplate,
+    [client],
+  );
+  return (
+    <ProviderFormFull
+      {...props}
+      codexTemplateReady={!settings.isPending}
+      getCodexCustomTemplateSetting={getCustomTemplate}
+    />
+  );
 }
 
 function ProviderFormFull({
@@ -395,6 +422,10 @@ function ProviderFormFull({
   onManageAuthAccounts,
   onSubmittingChange,
   initialData,
+  storedCodexConfig,
+  codexTemplateReady = true,
+  getCodexCustomTemplateSetting,
+  onSubmitReadyChange,
   showButtons = true,
   isProxyTakeover = false,
   inactiveFields,
@@ -402,7 +433,10 @@ function ProviderFormFull({
   onEditorBaseChange,
   modeView,
   onStackLayoutChange,
-}: ProviderFormProps) {
+}: ProviderFormProps & {
+  codexTemplateReady?: boolean;
+  getCodexCustomTemplateSetting?: () => string | undefined;
+}) {
   if (appId === "claude-desktop") {
     throw new Error("ProviderFormFull should not receive claude-desktop");
   }
@@ -423,6 +457,32 @@ function ProviderFormFull({
     initialCodexOfficialIdentity !== "api_key";
   const isDarkMode = useDarkMode();
 
+  const storedToml =
+    storedCodexConfig ??
+    (typeof initialData?.settingsConfig?.config === "string"
+      ? initialData.settingsConfig.config
+      : "");
+  const [codexFullMode, setCodexFullMode] = useState(
+    initialData?.meta?.codexFullConfig === true,
+  );
+  const initialFullToml =
+    initialData?.meta?.codexFullConfig &&
+    typeof initialData.settingsConfig?.config === "string"
+      ? initialData.settingsConfig.config
+      : storedToml;
+  const [fullToml, setFullToml] = useState(initialFullToml);
+  const [managedCodexView, setManagedCodexView] =
+    useState<ProviderEditorView | null>(null);
+  const [fullCodexView, setFullCodexView] = useState<ProviderEditorView | null>(
+    null,
+  );
+  const [codexModeError, setCodexModeError] = useState<string | null>(null);
+  const [loadingCodexView, setLoadingCodexView] = useState(false);
+  const customProjectionPending = useRef(false);
+  const codexSelection = useRef(0);
+  const [customCodexInitialized, setCustomCodexInitialized] = useState(false);
+  const [codexSeedRequest, setCodexSeedRequest] = useState(0);
+  const [codexSeedError, setCodexSeedError] = useState<string | null>(null);
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(
     initialData ? null : "custom",
   );
@@ -479,6 +539,15 @@ function ProviderFormFull({
     stateSyncedFor.current = { appId, initialData, supportsFullUrl };
     setSelectedPresetId(initialData ? null : "custom");
     setActivePreset(null);
+    setCodexFullMode(initialData?.meta?.codexFullConfig === true);
+    setFullToml(initialFullToml);
+    codexSelection.current += 1;
+    setLoadingCodexView(false);
+    setManagedCodexView(null);
+    setFullCodexView(null);
+    setCodexModeError(null);
+    setCodexSeedError(null);
+    setCustomCodexInitialized(false);
 
     if (!initialData) {
       setDraftCustomEndpoints([]);
@@ -513,7 +582,7 @@ function ProviderFormFull({
       ),
     );
     setClaudeStackRows(initialClaudeStackRows(initialData?.meta?.stackModels));
-  }, [appId, initialData, supportsFullUrl]);
+  }, [appId, initialData, supportsFullUrl, initialFullToml]);
 
   const defaultValues: ProviderFormData = useMemo(
     () => ({
@@ -904,6 +973,7 @@ function ProviderFormFull({
         : "",
     );
 
+  const fullTomlValidation = useCodexTomlValidation();
   const { configError: codexConfigError, debouncedValidate } =
     useCodexTomlValidation();
 
@@ -942,7 +1012,10 @@ function ProviderFormFull({
 
   // 新增：预设或模板投影到当前配置文件上显示。每次重置显示内容都要重新投影，否则保存时
   // 三方比较的底和显示内容对不上。
-  const { projectDraft } = useDraftEditorProjection(appId, onEditorBaseChange);
+  const { projectDraft, clearDraftProjection } = useDraftEditorProjection(
+    appId,
+    onEditorBaseChange,
+  );
   const projectCodexDraft = useCallback(
     (
       auth: Record<string, unknown>,
@@ -961,17 +1034,50 @@ function ProviderFormFull({
   );
 
   useEffect(() => {
-    if (appId === "codex" && !initialData && selectedPresetId === "custom") {
-      const template = getCodexCustomTemplate();
-      resetCodexConfig(template.auth, template.config);
-      setCodexChatReasoning({});
-      setPromptCacheRouting("auto");
-      projectCodexDraft(template.auth, template.config);
-    }
+    if (
+      appId !== "codex" ||
+      initialData ||
+      selectedPresetId !== "custom" ||
+      !codexTemplateReady ||
+      customCodexInitialized
+    )
+      return;
+    let cancelled = false;
+    void providersApi
+      .getCodexLocalConfig()
+      .then((local) => {
+        if (cancelled) return;
+        const seed = local ?? getCodexCustomTemplateSetting?.();
+        setFullToml(seed ?? "");
+        setCodexFullMode(typeof seed === "string");
+        setCustomCodexInitialized(true);
+        const template = getCodexCustomTemplate();
+        resetCodexConfig(template.auth, template.config);
+        setCodexChatReasoning({});
+        setPromptCacheRouting("auto");
+        customProjectionPending.current = typeof seed === "string";
+        if (customProjectionPending.current) {
+          clearDraftProjection();
+        } else {
+          projectCodexDraft(template.auth, template.config);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled)
+          setCodexSeedError(extractErrorMessage(error) || String(error));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [
+    clearDraftProjection,
     appId,
     initialData,
     selectedPresetId,
+    codexTemplateReady,
+    getCodexCustomTemplateSetting,
+    customCodexInitialized,
+    codexSeedRequest,
     resetCodexConfig,
     projectCodexDraft,
   ]);
@@ -1080,6 +1186,80 @@ function ProviderFormFull({
         selectedPresetEntry?.preset.category === "official"));
   const isCodexOfficialManagedOauthBound =
     isCodexOfficialProvider && Boolean(selectedCodexAccountId);
+  const canUseFullConfig =
+    appId === "codex" &&
+    (isEditMode || selectedPresetId === "custom") &&
+    category !== "official" &&
+    !isCodexOfficialProvider &&
+    !isCopilotProvider &&
+    !isXaiOauthProvider &&
+    initialProviderType !== "codex_oauth" &&
+    initialData?.meta?.authBinding?.source !== "managed_account";
+  const useFullCodexConfig = canUseFullConfig && codexFullMode;
+  const waitingForCustomCodex =
+    appId === "codex" &&
+    !initialData &&
+    selectedPresetId === "custom" &&
+    !customCodexInitialized;
+  const showCodexFormFields =
+    appId === "codex" && !useFullCodexConfig && !waitingForCustomCodex;
+  useEffect(() => {
+    if (appId === "codex")
+      onSubmitReadyChange?.(!waitingForCustomCodex && !loadingCodexView);
+  }, [appId, waitingForCustomCodex, loadingCodexView, onSubmitReadyChange]);
+
+  // Each editing mode keeps the exact view used to seed its draft as its save base.
+  const toggleFullConfig = async (full: boolean) => {
+    setCodexModeError(null);
+    const needsView =
+      initialData &&
+      (full
+        ? !initialData.meta?.codexFullConfig && !fullCodexView
+        : initialData.meta?.codexFullConfig && !managedCodexView);
+    if (needsView || (!full && customProjectionPending.current)) {
+      const selection = codexSelection.current;
+      setLoadingCodexView(true);
+      try {
+        if (initialData) {
+          const view = await providersApi.getEditorView(
+            "codex",
+            {
+              ...initialData.settingsConfig,
+              config: full ? storedToml : initialFullToml,
+            },
+            initialData.category,
+            providerId,
+            { ...initialData.meta, codexFullConfig: full },
+          );
+          if (selection !== codexSelection.current) return;
+          const text =
+            typeof view.settings.config === "string"
+              ? view.settings.config
+              : "";
+          if (full) {
+            setFullCodexView(view);
+            setFullToml(text);
+          } else {
+            setManagedCodexView(view);
+            setCodexConfig(text);
+          }
+        } else {
+          const template = getCodexCustomTemplate();
+          await projectCodexDraft(template.auth, template.config);
+          if (selection !== codexSelection.current) return;
+          customProjectionPending.current = false;
+        }
+      } catch (error) {
+        if (selection === codexSelection.current)
+          setCodexModeError(extractErrorMessage(error) || String(error));
+        return;
+      } finally {
+        if (selection === codexSelection.current) setLoadingCodexView(false);
+      }
+    }
+    setCodexFullMode(full);
+  };
+
   // 在聚合那格打开（没给就看应用实际是否在聚合模式）时，新增 / 编辑用聚合的简化表单
   const useStackLayout =
     (modeView ?? appModeView?.mode) === "stack" &&
@@ -1388,6 +1568,13 @@ function ProviderFormFull({
     (appId === "claude" || appId === "codex") && category !== "official";
 
   const handleSubmit = async (values: ProviderFormData) => {
+    if (waitingForCustomCodex || loadingCodexView) return;
+    if (useFullCodexConfig && codexAuthError) {
+      toast.error(codexAuthError);
+      return;
+    }
+    if (useFullCodexConfig && !fullTomlValidation.validateToml(fullToml))
+      return;
     if (
       supportsBillingMultiplier &&
       !isValidBillingMultiplier(billingMultiplier)
@@ -1738,7 +1925,7 @@ function ProviderFormFull({
             }),
           );
         }
-      } else if (appId === "codex") {
+      } else if (appId === "codex" && !useFullCodexConfig) {
         // 托管 OAuth 预设（Copilot/xAI）：端点由 adapter 硬定向、token 由代理注入，
         // 两项都不需要用户填写
         if (!isCopilotProvider && !isXaiOauthProvider && !codexBaseUrl.trim()) {
@@ -1757,7 +1944,7 @@ function ProviderFormFull({
         }
       }
       // Stack 布局：一个模型都没有的供应商加进 Stack 后不会出现在模型选择器里。
-      if (useStackLayout) {
+      if (useStackLayout && !useFullCodexConfig) {
         const hasNoModels =
           appId === "claude"
             ? normalizeClaudeStackModels(shownClaudeStackRows).length === 0
@@ -1825,10 +2012,16 @@ function ProviderFormFull({
           isCodexOfficialManagedOauthBound || wasCodexOfficialManagedOauthBound;
         const authJson = shouldStripCodexOfficialAuth
           ? {}
-          : JSON.parse(codexAuth);
-        const codexConfigForSave = codexConfig ?? "";
+          : JSON.parse(
+              useFullCodexConfig && !codexAuth.trim() ? "{}" : codexAuth,
+            );
+        const codexConfigForSave = useFullCodexConfig
+          ? fullToml
+          : (codexConfig ?? "");
         let normalizedCodexConfig =
-          category !== "official" && codexConfigForSave.trim()
+          !useFullCodexConfig &&
+          category !== "official" &&
+          codexConfigForSave.trim()
             ? setCodexWireApi(codexConfigForSave, "responses")
             : codexConfigForSave;
         // 模型映射与「路由接管」解耦：对所有非官方供应商，填了就持久化
@@ -1843,6 +2036,7 @@ function ProviderFormFull({
         // first catalog row so "fill mapping only" keeps its old behavior.
         // Stack 布局的 ★ 也是当场写 `model`，这里一样只补空的。
         if (
+          !useFullCodexConfig &&
           normalizedCatalogModels.length > 0 &&
           !extractCodexModelName(normalizedCodexConfig)
         ) {
@@ -1881,6 +2075,10 @@ function ProviderFormFull({
         }
         settingsConfig = JSON.stringify(configObj);
       } catch (err) {
+        if (useFullCodexConfig) {
+          toast.error(String(err));
+          return;
+        }
         settingsConfig = values.settingsConfig.trim();
       }
     } else if (usesGeminiStyleForm(appId)) {
@@ -1923,11 +2121,15 @@ function ProviderFormFull({
       settingsConfig = values.settingsConfig.trim();
     }
 
+    const codexEditorView = useFullCodexConfig
+      ? fullCodexView
+      : managedCodexView;
     const payload: ProviderFormValues = {
       ...values,
       name: values.name.trim(),
       websiteUrl: values.websiteUrl?.trim() ?? "",
       settingsConfig,
+      ...(codexEditorView ? { codexEditorBase: codexEditorView.settings } : {}),
     };
 
     if (isCodexOfficialProvider) {
@@ -2063,6 +2265,7 @@ function ProviderFormFull({
 
     const nextMeta: ProviderMeta = {
       ...(baseMeta ?? {}),
+      codexFullConfig: useFullCodexConfig || undefined,
       opencodeConfigFormat: isNativeOpencode ? "v2" : undefined,
       // Claude Code、Codex、Gemini CLI 的通用配置片段已冻结：沿用行里原有的标记，新增时
       // 由后端写 true（兼容旧版）。
@@ -2330,6 +2533,16 @@ function ProviderFormFull({
 
   const handlePresetChange = (value: string) => {
     setSelectedPresetId(value);
+    if (appId === "codex") {
+      codexSelection.current += 1;
+      setLoadingCodexView(false);
+      customProjectionPending.current = false;
+      setCodexSeedError(null);
+      setCodexSeedRequest((request) => request + 1);
+      setCustomCodexInitialized(false);
+      setCodexFullMode(false);
+      setFullToml("");
+    }
     // Stack 模型是这家自己的：换预设后回到跟着新预设的模型映射。
     setClaudeStackRows(null);
     if (value === "custom") {
@@ -2337,16 +2550,8 @@ function ProviderFormFull({
       form.reset(defaultValues);
 
       if (appId === "codex") {
-        const template = getCodexCustomTemplate();
-        resetCodexConfig(template.auth, template.config);
-        setCodexChatReasoning({});
-        setPromptCacheRouting("auto");
         setCodexCopilotApiFormat("auto");
-        setLocalCodexApiFormat(
-          codexApiFormatFromWireApi(extractCodexWireApi(template.config)) ??
-            "openai_responses",
-        );
-        projectCodexDraft(template.auth, template.config);
+        setLocalCodexApiFormat("openai_responses");
       }
       if (usesGeminiStyleForm(appId)) {
         resetGeminiConfig({}, {});
@@ -2879,7 +3084,62 @@ function ProviderFormFull({
             />
           )}
 
-          {appId === "codex" && (
+          {canUseFullConfig && !waitingForCustomCodex && (
+            <div className="space-y-2">
+              <label className="inline-flex items-center gap-2 text-sm font-medium text-fg-1">
+                <input
+                  type="checkbox"
+                  className="ui-checkbox"
+                  checked={useFullCodexConfig}
+                  disabled={loadingCodexView}
+                  onChange={(event) =>
+                    void toggleFullConfig(event.target.checked)
+                  }
+                />
+                {t("codexConfig.fullConfig")}
+              </label>
+              {codexModeError !== null && (
+                <div className="space-y-2">
+                  <p role="alert" className="text-sm text-danger-text">
+                    config.toml · {codexModeError}
+                  </p>
+                  <Button
+                    type="button"
+                    variant="neutral"
+                    onClick={() => void toggleFullConfig(!useFullCodexConfig)}
+                  >
+                    {t("common.retry")}
+                  </Button>
+                </div>
+              )}
+              {useFullCodexConfig && (
+                <p className="text-xs text-fg-2">
+                  {t("codexConfig.fullConfigHint")}
+                </p>
+              )}
+            </div>
+          )}
+          {waitingForCustomCodex &&
+            (codexSeedError !== null ? (
+              <div className="space-y-2">
+                <p role="alert" className="text-sm text-danger-text">
+                  config.toml · {codexSeedError}
+                </p>
+                <Button
+                  type="button"
+                  variant="neutral"
+                  onClick={() => {
+                    setCodexSeedError(null);
+                    setCodexSeedRequest((request) => request + 1);
+                  }}
+                >
+                  {t("common.retry")}
+                </Button>
+              </div>
+            ) : (
+              <p className="text-sm text-fg-2">{t("common.loading")}</p>
+            ))}
+          {showCodexFormFields && (
             <CodexFormFields
               providerId={providerId}
               isCopilotPreset={isCopilotProvider}
@@ -3118,7 +3378,30 @@ function ProviderFormFull({
           )}
 
           {/* 配置编辑器：Codex、Claude、Gemini 分别使用不同的编辑器 */}
-          {useStackLayout ? (
+          {useFullCodexConfig ? (
+            <div className="space-y-2">
+              <Label htmlFor="codexFullToml">config.toml</Label>
+              <JsonEditor
+                id="codexFullToml"
+                ariaLabel="config.toml"
+                value={fullToml}
+                onChange={(value) => {
+                  setFullToml(value);
+                  fullTomlValidation.debouncedValidate(value);
+                }}
+                language="javascript"
+                darkMode={isDarkMode}
+                rows={12}
+                showValidation={false}
+              />
+              {fullTomlValidation.configError && (
+                <p role="alert" className="text-xs text-danger-text">
+                  {fullTomlValidation.configError}
+                </p>
+              )}
+              {settingsConfigErrorField}
+            </div>
+          ) : useStackLayout || waitingForCustomCodex ? (
             settingsConfigErrorField
           ) : appId === "codex" ? (
             <>
@@ -3132,7 +3415,7 @@ function ProviderFormFull({
                 onConfigChange={handleCodexConfigChange}
                 authError={codexAuthError}
                 configError={codexConfigError}
-                inactiveFields={inactiveFields}
+                inactiveFields={managedCodexView?.inactive ?? inactiveFields}
               />
               {settingsConfigErrorField}
             </>
@@ -3323,6 +3606,7 @@ function ProviderFormFull({
 }
 
 export type ProviderFormValues = ProviderFormData & {
+  codexEditorBase?: Record<string, unknown>;
   presetId?: string;
   presetCategory?: ProviderCategory;
   isPartner?: boolean;

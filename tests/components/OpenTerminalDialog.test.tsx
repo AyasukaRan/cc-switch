@@ -419,6 +419,16 @@ describe("OpenTerminalDialog", () => {
     expect(terminalAvailable(official, "claude", false)).toBe(true);
   });
 
+  it("opens a full config through the active provider, including cards with proxy metadata", () => {
+    const provider: Provider = {
+      ...codexRelay,
+      meta: { codexFullConfig: true, apiFormat: "openai_chat" },
+    };
+    expect(terminalNeedsRoute(provider, "codex")).toBe(false);
+    expect(terminalAvailable(provider, "codex", false)).toBe(false);
+    expect(terminalAvailable(provider, "codex", true)).toBe(true);
+  });
+
   // 终端直连卡上的地址：要经路由的卡（托管账号、非原生格式）直连不通，托管账号卡没 Key，
   // Claude Code 的临时文件把凭据置空后只会提示 /login。按钮照样显示（卡片对齐），但置灰
   it("keeps the terminal button but marks route-only cards, current or not", () => {

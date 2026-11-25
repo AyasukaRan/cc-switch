@@ -890,3 +890,339 @@ async fn exiting_proxy_after_logout_on_a_third_party_route_stays_logged_out() {
     let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
     check_proxy_exit_keeps_login("relay", None).await;
 }
+
+fn full(id: &str, config: &str) -> Provider {
+    with_meta(
+        codex(id, Some("unused-card-key"), config),
+        ProviderMeta {
+            codex_full_config: Some(true),
+            ..Default::default()
+        },
+    )
+}
+
+const RAW_RELAY: &str = "# keep CRLF and the final comment\r\nprofile = 'office'\r\nmodel_provider = 'work'\r\n\r\n[model_providers.work]\r\nname = 'Work'\r\nbase_url = 'https://work.example/v1'\r\nenv_key = 'OFFICE_KEY'\r\n\r\n[profiles.office]\r\nmodel_provider = 'work'\r\n\r\n[features]\r\nmy_local_flag = true\r\n# eof";
+
+#[test]
+fn codex_full_config_switch_and_external_edit_keep_each_document() {
+    let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    reset_test_fs();
+    set_login_preservation(true);
+    let second = "# other\nmodel = 'm2'\n";
+    let state = setup(vec![full("raw-a", RAW_RELAY), full("raw-b", second)], true);
+    // This table happens to match the raw card's route. It was in the managed
+    // file before activation and is not a stale table installed by CC Switch.
+    let managed = "# managed only\r\n[model_providers.work]\r\nname = 'Personal'\r\nbase_url = 'https://work.example/v1'";
+    write_home_file(".codex/config.toml", managed);
+
+    switch(&state, "raw-a").unwrap();
+    assert_eq!(live_config_text(), RAW_RELAY);
+    assert_eq!(live_auth().as_deref(), Some(OAUTH_LOGIN));
+    switch(&state, "raw-b").unwrap();
+    assert_eq!(live_config_text(), second);
+
+    let external = "# Codex CLI updated this\r\nmodel = 'm3'\r\n";
+    write_home_file(".codex/config.toml", external);
+    switch(&state, "codex-official").unwrap();
+    assert_eq!(live_config_text(), managed);
+    let saved = state
+        .db
+        .get_provider_by_id("raw-b", &AppType::Codex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.settings_config["config"], external);
+    switch(&state, "raw-a").unwrap();
+    assert_eq!(live_config_text(), RAW_RELAY);
+    switch(&state, "raw-b").unwrap();
+    assert_eq!(live_config_text(), external);
+
+    let latest = "# edited again\nmodel = 'local'\n";
+    write_home_file(".codex/config.toml", latest);
+    switch(&state, "raw-b").unwrap();
+    assert_eq!(live_config_text(), latest);
+    let saved = state
+        .db
+        .get_provider_by_id("raw-b", &AppType::Codex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.settings_config["config"], latest);
+}
+
+#[test]
+fn codex_full_config_editor_reads_disk_and_compares_at_save() {
+    let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    reset_test_fs();
+    let state = setup(
+        vec![full("raw-a", RAW_RELAY), full("raw-b", "# other")],
+        false,
+    );
+    switch(&state, "raw-a").unwrap();
+    let opened = "# edited before opening\r\nmodel = 'local'\r\n";
+    write_home_file(".codex/config.toml", opened);
+    let view = |id: &str| {
+        let row = state
+            .db
+            .get_provider_by_id(id, &AppType::Codex)
+            .unwrap()
+            .unwrap();
+        ProviderService::editor_view_with_meta(
+            &state,
+            AppType::Codex,
+            &row.settings_config,
+            None,
+            Some(id),
+            None,
+        )
+        .unwrap()
+        .settings
+    };
+    assert_eq!(view("raw-b")["config"], "# other");
+    let base = view("raw-a");
+    assert_eq!(base["config"], opened);
+    let draft = "# edited in editor\nmodel = 'updated'\n";
+    let save = |text: &str, base: &Value, policy: &str| {
+        let editor = serde_json::from_value(json!({"base": base, "onConflict": policy})).unwrap();
+        ProviderService::update_from_editor(
+            &state,
+            AppType::Codex,
+            None,
+            full("raw-a", text),
+            Some(editor),
+        )
+    };
+    save(draft, &base, "refuse").unwrap();
+    assert_eq!(live_config_text(), draft);
+    let base = view("raw-a");
+    let external = "# changed after opening\r\nmodel = 'external'\r\n";
+    write_home_file(".codex/config.toml", external);
+    let next = "model = 'mine'\n";
+    assert!(save(next, &base, "refuse").is_err());
+    assert_eq!(live_config_text(), external);
+    assert_eq!(
+        state
+            .db
+            .get_provider_by_id("raw-a", &AppType::Codex)
+            .unwrap()
+            .unwrap()
+            .settings_config["config"],
+        draft
+    );
+    save(next, &base, "keepTheirs").unwrap();
+    assert_eq!(live_config_text(), external);
+    assert_eq!(
+        state
+            .db
+            .get_provider_by_id("raw-a", &AppType::Codex)
+            .unwrap()
+            .unwrap()
+            .settings_config["config"],
+        external
+    );
+    write_home_file(".codex/config.toml", "model = 'newer'\n");
+    save(next, &base, "keepMine").unwrap();
+    assert_eq!(live_config_text(), next);
+}
+
+#[test]
+fn codex_full_config_converting_a_current_managed_card_compares_the_disk_preview() {
+    let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    reset_test_fs();
+    let managed = codex(
+        "relay",
+        Some("key"),
+        &relay_config("team", "https://team.example/v1"),
+    );
+    let state = setup(vec![managed.clone()], false);
+    switch(&state, "relay").unwrap();
+    let opened = "# actual disk before opting in\r\nmodel = 'first'\r\n";
+    write_home_file(".codex/config.toml", opened);
+    let target = full("relay", "model = 'draft'\n");
+    let view = ProviderService::editor_view_with_meta(
+        &state,
+        AppType::Codex,
+        &managed.settings_config,
+        None,
+        Some("relay"),
+        target.meta.as_ref(),
+    )
+    .unwrap();
+    assert_eq!(view.settings["config"], opened);
+    let changed = "# changed while the mode toggle was open\nmodel = 'second'\n";
+    write_home_file(".codex/config.toml", changed);
+    let editor = serde_json::from_value(json!({"base": view.settings})).unwrap();
+    assert!(ProviderService::update_from_editor(
+        &state,
+        AppType::Codex,
+        None,
+        target,
+        Some(editor)
+    )
+    .is_err());
+    assert_eq!(live_config_text(), changed);
+    assert!(!state
+        .db
+        .get_provider_by_id("relay", &AppType::Codex)
+        .unwrap()
+        .unwrap()
+        .uses_codex_full_config());
+}
+
+#[test]
+fn codex_full_config_metadata_save_adopts_external_text_without_touching_login() {
+    let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    reset_test_fs();
+    set_login_preservation(false);
+    // An imported card can already be current without CC Switch ever having
+    // installed a file or a full-file ownership snapshot on this device.
+    let state = create_test_state().unwrap();
+    let mut card = full("imported", "# saved card");
+    seed_providers(&state, &AppType::Codex, &[card.clone()], &card.id);
+    write_home_file(".codex/config.toml", "# before opening\n");
+    write_home_file(".codex/auth.json", OAUTH_LOGIN);
+    let base = ProviderService::editor_view_with_meta(
+        &state,
+        AppType::Codex,
+        &card.settings_config,
+        None,
+        Some(&card.id),
+        None,
+    )
+    .unwrap()
+    .settings;
+    let external = "# externally updated\r\nmodel = 'disk'\r\n";
+    write_home_file(".codex/config.toml", external);
+    card.settings_config = base.clone();
+    card.name = "Renamed".into();
+    let editor = serde_json::from_value(json!({"base": base})).unwrap();
+    ProviderService::update_from_editor(&state, AppType::Codex, None, card, Some(editor)).unwrap();
+    let stored = state
+        .db
+        .get_provider_by_id("imported", &AppType::Codex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.settings_config["config"], external);
+    assert_eq!(stored.name, "Renamed");
+    assert_eq!(live_config_text(), external);
+    assert_eq!(live_auth().as_deref(), Some(OAUTH_LOGIN));
+}
+
+#[test]
+fn codex_full_config_blocks_login_fallback_even_with_a_stored_card_key() {
+    let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    reset_test_fs();
+    set_login_preservation(true);
+    let state = setup(
+        vec![
+            full("unsafe-table", "model_provider = 'work'\n[model_providers.work]\nbase_url = 'https://third.example/v1'\nrequires_openai_auth = true\nhttp_headers = { Authorization = 'Bearer header' }\n"),
+            full("unsafe-profile", "model_provider = 'work'\nopenai_base_url = 'https://third.example/v1'\n[model_providers.work]\nenv_key = 'WORK_KEY'\n[profiles.personal]\nmodel_provider = 'openai'\n"),
+        ],
+        true,
+    );
+    for id in ["unsafe-table", "unsafe-profile"] {
+        let before = snapshot(&state, id);
+        assert!(switch(&state, id).is_err());
+        assert_eq!(snapshot(&state, id), before);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock, reason = "test HOME is process-global")]
+async fn codex_full_config_proxy_exit_restores_the_direct_document() {
+    let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    reset_test_fs();
+    set_login_preservation(true);
+    let state = setup(vec![full("raw-a", RAW_RELAY)], false);
+    write_home_file(
+        ".codex/config.toml",
+        "# managed\n[features]\nmanually_set = true\n",
+    );
+    switch(&state, "raw-a").unwrap();
+    use_ephemeral_proxy_port(&state).await;
+    for stack in [false, true] {
+        let edited = format!("# externally edited before entering, stack={stack}\r\n{RAW_RELAY}");
+        write_home_file(".codex/config.toml", &edited);
+        cc_switch_lib::mode::controller::enter(&state, &AppType::Codex, stack)
+            .await
+            .unwrap();
+        let proxy = live_config_text();
+        assert!(proxy.contains("manually_set"));
+        assert!(!proxy.contains("my_local_flag"));
+        let stored = state
+            .db
+            .get_provider_by_id("raw-a", &AppType::Codex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.settings_config["config"], edited);
+        cc_switch_lib::mode::controller::exit(&state, &AppType::Codex)
+            .await
+            .unwrap();
+        assert_eq!(live_config_text(), edited);
+    }
+    switch(&state, "codex-official").unwrap();
+    assert!(live_config_text().contains("manually_set"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock, reason = "test HOME is process-global")]
+async fn codex_full_config_automatic_proxy_reattach_keeps_an_external_edit() {
+    let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    reset_test_fs();
+    let state = setup(vec![full("raw-a", RAW_RELAY)], false);
+    switch(&state, "raw-a").unwrap();
+    use_ephemeral_proxy_port(&state).await;
+    cc_switch_lib::mode::controller::enter(&state, &AppType::Codex, false)
+        .await
+        .unwrap();
+    cc_switch_lib::mode::controller::detach_all(&state).await;
+    let external = "# offline edit\nmodel = 'local'\n";
+    write_home_file(".codex/config.toml", external);
+    cc_switch_lib::mode::controller::startup(&state).await;
+    assert_eq!(live_config_text(), external);
+    assert_eq!(
+        state
+            .db
+            .get_provider_by_id("raw-a", &AppType::Codex)
+            .unwrap()
+            .unwrap()
+            .settings_config["config"],
+        RAW_RELAY
+    );
+}
+
+#[test]
+fn codex_full_config_mcp_sync_and_removal_edit_only_the_managed_base() {
+    use crate::golden::util::mcp_server;
+    use cc_switch_lib::McpService;
+
+    let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    reset_test_fs();
+    let state = setup(vec![full("raw-a", RAW_RELAY)], false);
+    write_home_file(
+        ".codex/config.toml",
+        "# managed\n[mcp_servers.previous]\ncommand = 'old'\n",
+    );
+    switch(&state, "raw-a").unwrap();
+    let server = mcp_server(
+        "shared",
+        json!({ "type": "stdio", "command": "sample" }),
+        &[AppType::Codex],
+    );
+    state.db.save_mcp_server(&server).unwrap();
+    let previous = mcp_server(
+        "previous",
+        json!({ "type": "stdio", "command": "old" }),
+        &[],
+    );
+    state.db.save_mcp_server(&previous).unwrap();
+    ProviderService::sync_current_provider_for_app(&state, AppType::Codex).unwrap();
+    assert_eq!(live_config_text(), RAW_RELAY);
+    McpService::sync_enabled_for_app(&state, &AppType::Codex).unwrap();
+    assert_eq!(live_config_text(), RAW_RELAY);
+    switch(&state, "codex-official").unwrap();
+    let doc = live_config();
+    assert_eq!(
+        doc["mcp_servers"]["shared"]["command"].as_str(),
+        Some("sample")
+    );
+    assert!(doc["mcp_servers"].get("previous").is_none());
+}

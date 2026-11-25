@@ -556,6 +556,9 @@ pub struct AppSettings {
     /// Opt-in: defaults to false so third-party switches cleanly overwrite auth.json.
     #[serde(default)]
     pub preserve_codex_official_auth_on_switch: bool,
+    /// Template for a new custom Codex provider when the local config.toml is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_custom_template: Option<String>,
     /// Pre-exhaustion protection for ChatGPT requests passing through the Codex proxy.
     #[serde(default)]
     pub codex_quota_protection: CodexQuotaProtection,
@@ -770,6 +773,7 @@ impl Default for AppSettings {
             auto_update_enabled: false,
             native_tray_menu: false,
             preserve_codex_official_auth_on_switch: false,
+            codex_custom_template: None,
             codex_quota_protection: CodexQuotaProtection::default(),
             codex_proxy_without_official_login: false,
             unify_codex_session_history: false,

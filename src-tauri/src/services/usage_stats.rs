@@ -328,17 +328,19 @@ pub struct RequestLogDetail {
     /// 写入时实际用于计价的模型名。None = v11 前的历史行，"" = 未计价的错误行。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
-/// 把 26 列的查询结果映射为 `RequestLogDetail`。
+/// 把 27 列的查询结果映射为 `RequestLogDetail`。
 ///
-/// 调用方的 SELECT **必须**按以下顺序返回 26 列：
+/// 调用方的 SELECT **必须**按以下顺序返回 27 列：
 /// `request_id, provider_id, provider_name, app_type, model, request_model,
 ///  cost_multiplier, input_tokens, output_tokens, cache_read_tokens,
 ///  cache_creation_tokens, input_cost_usd, output_cost_usd, cache_read_cost_usd,
 ///  cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
 ///  first_token_ms, duration_ms, status_code, error_message, created_at,
-///  data_source, pricing_model, input_token_semantics`
+///  data_source, pricing_model, input_token_semantics, service_tier`
 ///
 /// 不需要 provider_name 时（如 backfill）SELECT `NULL AS provider_name` 占位即可。
 fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLogDetail> {
@@ -371,6 +373,7 @@ fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reques
         data_source: row.get(23)?,
         pricing_model: row.get(24)?,
         input_token_semantics: row.get::<_, i64>(25)?,
+        service_tier: row.get(26)?,
     })
 }
 
@@ -2003,7 +2006,7 @@ impl Database {
                     l.input_cost_usd, l.output_cost_usd, l.cache_read_cost_usd, l.cache_creation_cost_usd, l.total_cost_usd,
                     l.is_streaming, l.latency_ms, l.first_token_ms, l.duration_ms,
                     l.status_code, l.error_message, l.created_at, l.data_source, l.pricing_model,
-                    l.input_token_semantics
+                    l.input_token_semantics, l.service_tier
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
              {where_clause}
@@ -2047,7 +2050,7 @@ impl Database {
                     l.input_cost_usd, l.output_cost_usd, l.cache_read_cost_usd, l.cache_creation_cost_usd, l.total_cost_usd,
                     l.is_streaming, l.latency_ms, l.first_token_ms, l.duration_ms,
                     l.status_code, l.error_message, l.created_at, l.data_source, l.pricing_model,
-                    l.input_token_semantics
+                    l.input_token_semantics, l.service_tier
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
              WHERE l.request_id = ?"
@@ -2066,13 +2069,15 @@ impl Database {
     }
 }
 
-#[derive(Clone)]
-struct PricingInfo {
-    input: rust_decimal::Decimal,
-    output: rust_decimal::Decimal,
-    cache_read: rust_decimal::Decimal,
-    cache_creation: rust_decimal::Decimal,
-}
+const REQUEST_COST_ROW: &str =
+    "SELECT request_id, provider_id, NULL AS provider_name, app_type, model, request_model,
+                        cost_multiplier,
+                        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                        input_cost_usd, output_cost_usd, cache_read_cost_usd,
+                        cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
+                        first_token_ms, duration_ms, status_code, error_message, created_at,
+                        data_source, pricing_model, input_token_semantics, service_tier
+             FROM proxy_request_logs";
 
 impl Database {
     /// Recalculate stored zero-cost usage rows once pricing becomes available.
@@ -2094,21 +2099,14 @@ impl Database {
         conn: &Connection,
         only_model_id: Option<&str>,
     ) -> Result<u64, AppError> {
-        const BASE_SQL: &str =
-            "SELECT request_id, provider_id, NULL AS provider_name, app_type, model, request_model,
-                        cost_multiplier,
-                        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-                        input_cost_usd, output_cost_usd, cache_read_cost_usd,
-                        cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
-                        first_token_ms, duration_ms, status_code, error_message, created_at,
-                        data_source, pricing_model, input_token_semantics
-             FROM proxy_request_logs
-             WHERE CAST(total_cost_usd AS REAL) <= 0
+        let sql = format!(
+            "{REQUEST_COST_ROW} WHERE CAST(total_cost_usd AS REAL) <= 0
                AND (input_tokens > 0 OR output_tokens > 0
-                    OR cache_read_tokens > 0 OR cache_creation_tokens > 0)";
+                    OR cache_read_tokens > 0 OR cache_creation_tokens > 0)"
+        );
 
         let mut logs = {
-            let mut stmt = conn.prepare(BASE_SQL)?;
+            let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map([], row_to_request_log_detail)?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
@@ -2151,17 +2149,44 @@ impl Database {
     fn maybe_backfill_log_costs(
         conn: &Connection,
         log: &mut RequestLogDetail,
-        pricing_cache: &mut HashMap<String, PricingInfo>,
+        pricing_cache: &mut HashMap<String, Option<ModelPricing>>,
     ) -> Result<bool, AppError> {
         let existing_cost = rust_decimal::Decimal::from_str(&log.total_cost_usd)
             .unwrap_or(rust_decimal::Decimal::ZERO);
-        let has_cost = existing_cost > rust_decimal::Decimal::ZERO;
+        if existing_cost > rust_decimal::Decimal::ZERO
+            || !Self::calculate_log_costs(conn, log, pricing_cache, false)?
+        {
+            return Ok(false);
+        }
+
+        conn.execute(
+            "UPDATE proxy_request_logs SET input_cost_usd = ?1, output_cost_usd = ?2,
+                    cache_read_cost_usd = ?3, cache_creation_cost_usd = ?4, total_cost_usd = ?5
+             WHERE request_id = ?6",
+            params![
+                log.input_cost_usd,
+                log.output_cost_usd,
+                log.cache_read_cost_usd,
+                log.cache_creation_cost_usd,
+                log.total_cost_usd,
+                log.request_id
+            ],
+        )?;
+        Ok(true)
+    }
+
+    fn calculate_log_costs(
+        conn: &Connection,
+        log: &mut RequestLogDetail,
+        pricing_cache: &mut HashMap<String, Option<ModelPricing>>,
+        only_adjusted_tier: bool,
+    ) -> Result<bool, AppError> {
         let has_usage = log.input_tokens > 0
             || log.output_tokens > 0
             || log.cache_read_tokens > 0
             || log.cache_creation_tokens > 0;
 
-        if has_cost || !has_usage {
+        if !has_usage {
             return Ok(false);
         }
 
@@ -2179,10 +2204,12 @@ impl Database {
             return Ok(false);
         }
 
-        let pricing = match Self::get_log_model_pricing_cached(conn, pricing_cache, log)? {
-            Some(info) => info,
-            None => return Ok(false),
-        };
+        let pricing =
+            match Self::get_log_model_pricing_cached(conn, pricing_cache, log, only_adjusted_tier)?
+            {
+                Some(info) => info,
+                None => return Ok(false),
+            };
 
         let million = rust_decimal::Decimal::from(1_000_000u64);
 
@@ -2203,82 +2230,76 @@ impl Database {
                 // v12 and earlier: input included cache reads but excluded cache writes.
                 (log.input_tokens as u64).saturating_sub(log.cache_read_tokens as u64)
             };
-        let input_cost =
-            rust_decimal::Decimal::from(billable_input_tokens) * pricing.input / million;
-        let output_cost =
-            rust_decimal::Decimal::from(log.output_tokens as u64) * pricing.output / million;
+        let input_cost = rust_decimal::Decimal::from(billable_input_tokens)
+            * pricing.input_cost_per_million
+            / million;
+        let output_cost = rust_decimal::Decimal::from(log.output_tokens as u64)
+            * pricing.output_cost_per_million
+            / million;
         let cache_read_cost = rust_decimal::Decimal::from(log.cache_read_tokens as u64)
-            * pricing.cache_read
+            * pricing.cache_read_cost_per_million
             / million;
         let cache_creation_cost = rust_decimal::Decimal::from(log.cache_creation_tokens as u64)
-            * pricing.cache_creation
+            * pricing.cache_creation_cost_per_million
             / million;
         // 总成本 = 基础成本之和 × 倍率
         let base_total = input_cost + output_cost + cache_read_cost + cache_creation_cost;
         let total_cost = base_total * multiplier;
 
-        log.input_cost_usd = format!("{input_cost:.6}");
-        log.output_cost_usd = format!("{output_cost:.6}");
-        log.cache_read_cost_usd = format!("{cache_read_cost:.6}");
-        log.cache_creation_cost_usd = format!("{cache_creation_cost:.6}");
-        log.total_cost_usd = format!("{total_cost:.6}");
-
-        conn.execute(
-            "UPDATE proxy_request_logs
-             SET input_cost_usd = ?1,
-                 output_cost_usd = ?2,
-                 cache_read_cost_usd = ?3,
-                 cache_creation_cost_usd = ?4,
-                 total_cost_usd = ?5
-             WHERE request_id = ?6",
-            params![
-                log.input_cost_usd,
-                log.output_cost_usd,
-                log.cache_read_cost_usd,
-                log.cache_creation_cost_usd,
-                log.total_cost_usd,
-                log.request_id
-            ],
-        )
-        .map_err(|e| AppError::Database(format!("更新请求成本失败: {e}")))?;
+        // Codex writes the full decimal amount per request. Cutting fractional
+        // microdollars here would make an upgraded ledger differ from a fresh import.
+        let stored_amount = |value: rust_decimal::Decimal| {
+            if log.app_type == "codex" && value.normalize().scale() > 6 {
+                value.to_string()
+            } else {
+                format!("{value:.6}")
+            }
+        };
+        log.input_cost_usd = stored_amount(input_cost);
+        log.output_cost_usd = stored_amount(output_cost);
+        log.cache_read_cost_usd = stored_amount(cache_read_cost);
+        log.cache_creation_cost_usd = stored_amount(cache_creation_cost);
+        log.total_cost_usd = stored_amount(total_cost);
 
         Ok(true)
     }
 
     fn get_model_pricing_cached(
         conn: &Connection,
-        cache: &mut HashMap<String, PricingInfo>,
+        cache: &mut HashMap<String, Option<ModelPricing>>,
         model: &str,
-    ) -> Result<Option<PricingInfo>, AppError> {
+    ) -> Result<Option<ModelPricing>, AppError> {
         if let Some(info) = cache.get(model) {
-            return Ok(Some(info.clone()));
+            return Ok(info.clone());
         }
-
-        let row = find_model_pricing_row(conn, model)?;
-        let Some((input, output, cache_read, cache_creation)) = row else {
-            return Ok(None);
-        };
-
-        let pricing = PricingInfo {
-            input: rust_decimal::Decimal::from_str(&input)
-                .map_err(|e| AppError::Database(format!("解析输入价格失败: {e}")))?,
-            output: rust_decimal::Decimal::from_str(&output)
-                .map_err(|e| AppError::Database(format!("解析输出价格失败: {e}")))?,
-            cache_read: rust_decimal::Decimal::from_str(&cache_read)
-                .map_err(|e| AppError::Database(format!("解析缓存读取价格失败: {e}")))?,
-            cache_creation: rust_decimal::Decimal::from_str(&cache_creation)
-                .map_err(|e| AppError::Database(format!("解析缓存写入价格失败: {e}")))?,
-        };
-
+        let pricing = find_model_pricing_row(conn, model)?
+            .map(|(input, output, read, write)| {
+                ModelPricing::from_strings(&input, &output, &read, &write)
+            })
+            .transpose()
+            .map_err(|e| AppError::Database(format!("解析模型 {model} 定价失败: {e}")))?;
         cache.insert(model.to_string(), pricing.clone());
-        Ok(Some(pricing))
+        Ok(pricing)
     }
 
     fn get_log_model_pricing_cached(
         conn: &Connection,
-        cache: &mut HashMap<String, PricingInfo>,
+        cache: &mut HashMap<String, Option<ModelPricing>>,
         log: &RequestLogDetail,
-    ) -> Result<Option<PricingInfo>, AppError> {
+        only_adjusted_tier: bool,
+    ) -> Result<Option<ModelPricing>, AppError> {
+        let mut lookup = |model: &str| -> Result<_, AppError> {
+            let pricing = Self::get_model_pricing_cached(conn, cache, model)?;
+            Ok(if log.app_type == "codex" {
+                pricing.and_then(|base| {
+                    let adjusted =
+                        base.for_codex_request(model, log.service_tier.as_deref(), log.created_at);
+                    (!only_adjusted_tier || adjusted != base).then_some(adjusted)
+                })
+            } else {
+                pricing
+            })
+        };
         // 写入时的计价基准已落库（v11+）：回填只按它重算，找不到就保持 0 成本
         // 等补价。不能换用 model/request_model 猜——路由接管 + request 计价模式下
         // 三者可能各不相同（model=上游回显、request_model=客户端别名、
@@ -2289,10 +2310,10 @@ impl Database {
             .as_deref()
             .filter(|pm| !is_placeholder_pricing_model(pm))
         {
-            return Self::get_model_pricing_cached(conn, cache, pricing_model);
+            return lookup(pricing_model);
         }
 
-        if let Some(pricing) = Self::get_model_pricing_cached(conn, cache, &log.model)? {
+        if let Some(pricing) = lookup(&log.model)? {
             return Ok(Some(pricing));
         }
 
@@ -2312,8 +2333,66 @@ impl Database {
             return Ok(None);
         }
 
-        Self::get_model_pricing_cached(conn, cache, request_model)
+        lookup(request_model)
     }
+}
+
+/// Enrich a surviving session request during a cursor replay. Missing IDs can belong to
+/// daily rollups, so this operation must never insert. Leave the original amounts intact
+/// if the caller has no model/tier correction or the model's price is no longer available.
+pub(crate) fn backfill_codex_service_tier(
+    conn: &Connection,
+    request_id: &str,
+    model: &str,
+    tier: Option<&str>,
+    pricing_cache: &mut HashMap<String, Option<ModelPricing>>,
+) -> Result<bool, AppError> {
+    static SELECT: LazyLock<String> = LazyLock::new(|| {
+        format!(
+            "{REQUEST_COST_ROW} WHERE request_id = ?1 AND app_type = 'codex'
+                AND data_source = 'codex_session' AND service_tier IS NULL"
+        )
+    });
+    let Some(mut log) = conn
+        .prepare_cached(&SELECT)?
+        .query_row([request_id], row_to_request_log_detail)
+        .optional()?
+    else {
+        return Ok(false);
+    };
+    let tier = tier.and_then(crate::proxy::usage::calculator::normalize_codex_service_tier);
+    let model_changed = !is_placeholder_pricing_model(model) && model != log.model;
+    if tier.is_none() && !model_changed {
+        return Ok(false);
+    }
+    if model_changed {
+        log.model = model.to_owned();
+        log.request_model = Some(model.to_owned());
+    }
+    log.service_tier = tier.map(str::to_owned);
+    if model_changed || tier.is_some_and(|value| value != "default") {
+        Database::calculate_log_costs(conn, &mut log, pricing_cache, !model_changed)?;
+    }
+    conn.prepare_cached(
+        "UPDATE proxy_request_logs SET model = ?1, request_model = ?2, service_tier = ?3,
+                input_cost_usd = ?4, output_cost_usd = ?5, cache_read_cost_usd = ?6,
+                cache_creation_cost_usd = ?7, total_cost_usd = ?8
+         WHERE request_id = ?9 AND app_type = 'codex' AND data_source = 'codex_session'
+           AND service_tier IS NULL",
+    )?
+    .execute(params![
+        log.model,
+        log.request_model,
+        log.service_tier,
+        log.input_cost_usd,
+        log.output_cost_usd,
+        log.cache_read_cost_usd,
+        log.cache_creation_cost_usd,
+        log.total_cost_usd,
+        request_id
+    ])
+    .map(|rows| rows > 0)
+    .map_err(Into::into)
 }
 
 pub(crate) fn find_model_pricing(conn: &Connection, model_id: &str) -> Option<ModelPricing> {
@@ -2429,7 +2508,7 @@ fn query_model_pricing_prefix(
     .map_err(|e| AppError::Database(format!("查询模型前缀定价失败: {e}")))
 }
 
-fn model_pricing_candidates(model_id: &str) -> Vec<String> {
+pub(crate) fn model_pricing_candidates(model_id: &str) -> Vec<String> {
     let cleaned = clean_model_id_for_pricing(model_id);
     if is_placeholder_pricing_model(&cleaned) {
         return Vec::new();
@@ -3652,6 +3731,167 @@ mod tests {
         assert_eq!(input_cost, "0.000900");
         assert_eq!(cache_read_cost, "0.000075");
         assert_eq!(total_cost, "0.001575");
+        Ok(())
+    }
+
+    #[test]
+    fn codex_tier_backfill_uses_original_timestamp_and_independent_provider_multiplier(
+    ) -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            for (id, at, source) in [
+                ("old-session", 1_803_887_999, "codex_session"),
+                ("post-promotion", 1_803_888_000, "proxy"),
+                ("standard", 1_803_887_999, "proxy"),
+            ] {
+                insert_usage_log(
+                    &conn,
+                    id,
+                    "codex",
+                    "test",
+                    "gpt-6.2-astra",
+                    source,
+                    at,
+                    1_000_000,
+                    100_000,
+                    500_000,
+                    0,
+                    200,
+                    "0",
+                )?;
+            }
+            conn.execute(
+                "UPDATE proxy_request_logs SET cost_multiplier = '1.5', input_token_semantics = 1",
+                [],
+            )?;
+            conn.execute("UPDATE proxy_request_logs SET total_cost_usd = '12.3', model = 'previous-turn' WHERE request_id = 'old-session'", [])?;
+            // The pricing basis can be an upstream model distinct from the request alias.
+            conn.execute(
+                "UPDATE proxy_request_logs SET model = 'alias', pricing_model = 'gpt-6.2-astra',
+                service_tier = 'ultrafast' WHERE request_id = 'post-promotion'",
+                [],
+            )?;
+            let mut cache = HashMap::new();
+            for (id, changed) in [
+                ("old-session", true),
+                ("old-session", false),
+                ("standard", false),
+                ("pruned", false),
+            ] {
+                assert_eq!(
+                    backfill_codex_service_tier(
+                        &conn,
+                        id,
+                        "gpt-6.2-astra",
+                        Some("ultrafast"),
+                        &mut cache
+                    )?,
+                    changed
+                );
+            }
+        }
+        assert_eq!(
+            db.backfill_missing_usage_costs_for_model("gpt-6.2-astra")?,
+            2
+        );
+        for (id, input, total, tier) in [
+            ("old-session", "12.000000", "36.900000", Some("ultrafast")),
+            (
+                "post-promotion",
+                "24.000000",
+                "73.800000",
+                Some("ultrafast"),
+            ),
+            ("standard", "4.000000", "12.300000", None),
+        ] {
+            let log = db.get_request_detail(id)?.unwrap();
+            assert_eq!(log.input_cost_usd, input);
+            assert_eq!(log.total_cost_usd, total);
+            assert_eq!(log.service_tier.as_deref(), tier);
+            if id == "old-session" {
+                assert_eq!(log.model, "gpt-6.2-astra");
+                assert_eq!(log.request_model.as_deref(), Some("gpt-6.2-astra"));
+            }
+        }
+        assert!(db.get_request_detail("pruned")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn codex_tier_replay_preserves_unpriced_and_standard_historical_costs() -> Result<(), AppError>
+    {
+        let db = Database::memory()?;
+        let conn = lock_conn!(db.conn);
+        let mut cache = HashMap::new();
+        for (model, tier) in [
+            ("no-longer-priced", "priority"),
+            ("gpt-6.2-astra", "default"),
+            ("gpt-6.1-terra", "ultrafast"),
+        ] {
+            insert_usage_log(
+                &conn,
+                model,
+                "codex",
+                "_codex_session",
+                model,
+                "codex_session",
+                1000,
+                2000,
+                400,
+                1000,
+                0,
+                200,
+                "0.123456",
+            )?;
+            assert!(backfill_codex_service_tier(
+                &conn,
+                model,
+                model,
+                Some(tier),
+                &mut cache
+            )?);
+            assert_eq!(conn.query_row(
+                "SELECT service_tier, total_cost_usd FROM proxy_request_logs WHERE request_id = ?1",
+                [model], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            )?, (tier.to_owned(), "0.123456".to_owned()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn codex_replay_preserves_fractional_microdollars() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let conn = lock_conn!(db.conn);
+        let model = "gpt-6.2-astra";
+        insert_usage_log(
+            &conn,
+            "fraction",
+            "codex",
+            "_codex_session",
+            model,
+            "codex_session",
+            1_800_000_000,
+            1,
+            0,
+            1,
+            0,
+            200,
+            "0.0000004",
+        )?;
+        assert!(backfill_codex_service_tier(
+            &conn,
+            "fraction",
+            model,
+            Some("ultrafast"),
+            &mut HashMap::new()
+        )?);
+        let (cached, total): (String, String) = conn.query_row(
+            "SELECT cache_read_cost_usd, total_cost_usd FROM proxy_request_logs WHERE request_id = 'fraction'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let expected = rust_decimal::Decimal::new(12, 7);
+        assert_eq!(rust_decimal::Decimal::from_str(&cached).unwrap(), expected);
+        assert_eq!(rust_decimal::Decimal::from_str(&total).unwrap(), expected);
         Ok(())
     }
 

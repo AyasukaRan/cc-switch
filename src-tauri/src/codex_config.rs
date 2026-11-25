@@ -886,14 +886,19 @@ pub fn write_codex_live_atomic(
     Ok(())
 }
 
+/// An empty file is an existing user configuration. Only absence permits a template fallback.
+pub(crate) fn read_optional_codex_config_text() -> Result<Option<String>, AppError> {
+    let path = get_codex_config_path();
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(AppError::io(path, error)),
+    }
+}
+
 /// 读取 `~/.codex/config.toml`，若不存在返回空字符串
 pub fn read_codex_config_text() -> Result<String, AppError> {
-    let path = get_codex_config_path();
-    if path.exists() {
-        std::fs::read_to_string(&path).map_err(|e| AppError::io(&path, e))
-    } else {
-        Ok(String::new())
-    }
+    Ok(read_optional_codex_config_text()?.unwrap_or_default())
 }
 
 /// `config.toml` 是不是用 `[features] multi_agent_v2` 强制了新版子 agent 工具：写成 `true`，
@@ -3363,6 +3368,24 @@ mod tests {
     use crate::test_support::TestHome;
     use serde_json::json;
     use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn local_config_distinguishes_missing_empty_and_unreadable_files() {
+        let _home = TestHome::new();
+        let path = get_codex_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert_eq!(read_optional_codex_config_text().unwrap(), None);
+        for original in ["", "# keep comment and line endings\r\n[unfinished"] {
+            fs::write(&path, original).unwrap();
+            assert_eq!(
+                read_optional_codex_config_text().unwrap().as_deref(),
+                Some(original)
+            );
+        }
+        fs::write(&path, [0xff]).unwrap();
+        assert!(read_optional_codex_config_text().is_err());
+    }
 
     #[test]
     fn official_proxy_route_is_recognized_by_its_address() {

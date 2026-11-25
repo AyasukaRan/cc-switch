@@ -446,10 +446,17 @@ impl McpService {
     /// 应用的 MCP 状态陈旧。全部跑完后若有失败，聚合成一个错误上报，
     /// 保留调用方的可见性。
     pub fn sync_all_enabled(state: &AppState) -> Result<(), AppError> {
+        Self::sync_enabled_for_apps(state, AppType::all())
+    }
+
+    pub(crate) fn sync_enabled_for_apps(
+        state: &AppState,
+        apps: impl Iterator<Item = AppType>,
+    ) -> Result<(), AppError> {
         let servers = Self::get_all_servers(state)?;
 
         let mut failures: Vec<String> = Vec::new();
-        for app in AppType::all() {
+        for app in apps {
             if let Err(err) = Self::project_servers_to_app(&servers, &app) {
                 log::warn!("同步 MCP 到 {app:?} 失败: {err}");
                 failures.push(format!("{}: {err}", app.as_str()));

@@ -195,7 +195,7 @@ pub async fn handle_streaming(
     let stream = response.bytes_stream();
 
     // 创建使用量收集器；关闭 usage logging 时不要在流式热路径上解析每个 SSE event。
-    let usage_collector = create_usage_collector(ctx, state, status.as_u16(), parser_config);
+    let usage_collector = create_usage_collector(ctx, state, status.as_u16(), parser_config, false);
 
     // 获取流式超时配置
     let timeout_config = ctx.streaming_timeout_config();
@@ -271,7 +271,7 @@ pub async fn handle_non_streaming(
                     ctx,
                     usage,
                     &model,
-                    &ctx.request_model,
+                    Some(&json_value),
                     status.as_u16(),
                     false,
                 );
@@ -288,7 +288,7 @@ pub async fn handle_non_streaming(
                     ctx,
                     TokenUsage::default(),
                     &model,
-                    &ctx.request_model,
+                    Some(&json_value),
                     status.as_u16(),
                     false,
                 );
@@ -308,7 +308,7 @@ pub async fn handle_non_streaming(
                 ctx,
                 TokenUsage::default(),
                 ctx.outbound_model.as_deref().unwrap_or(&ctx.request_model),
-                &ctx.request_model,
+                None,
                 status.as_u16(),
                 false,
             );
@@ -361,7 +361,7 @@ pub struct SseUsageCollector {
 }
 
 struct SseUsageCollectorInner {
-    events: Mutex<Vec<Value>>,
+    captured: Mutex<CollectedUsageEvents>,
     first_output_time: OnceLock<std::time::Instant>,
     start_time: std::time::Instant,
     on_complete: UsageCallbackWithTiming,
@@ -369,17 +369,29 @@ struct SseUsageCollectorInner {
     finished: AtomicBool,
 }
 
+#[derive(Default)]
+struct CollectedUsageEvents {
+    events: Vec<Value>,
+    // Chat can repeat model and tier on every text chunk. Keep one metadata
+    // snapshot plus the usage events, without retaining streamed message text.
+    codex_metadata: Option<serde_json::Map<String, Value>>,
+}
+
 impl SseUsageCollector {
     /// 创建使用量收集器；`should_collect` 用来在 hot path 跳过与 usage 无关的事件。
     pub fn new(
         start_time: std::time::Instant,
         should_collect: Option<StreamUsageEventFilter>,
+        collect_codex_metadata: bool,
         callback: impl Fn(Vec<Value>, Option<u64>) + Send + Sync + 'static,
     ) -> Self {
         let on_complete: UsageCallbackWithTiming = Arc::new(callback);
         Self {
             inner: Arc::new(SseUsageCollectorInner {
-                events: Mutex::new(Vec::new()),
+                captured: Mutex::new(CollectedUsageEvents {
+                    events: Vec::new(),
+                    codex_metadata: collect_codex_metadata.then(serde_json::Map::new),
+                }),
                 first_output_time: OnceLock::new(),
                 start_time,
                 on_complete,
@@ -412,8 +424,24 @@ impl SseUsageCollector {
 
     /// 推送 SSE 事件
     pub async fn push(&self, event: Value) {
-        let mut events = self.inner.events.lock().await;
-        events.push(event);
+        let mut captured = self.inner.captured.lock().await;
+        if let Some(metadata) = &mut captured.codex_metadata {
+            let envelope = event.get("response").unwrap_or(&event);
+            for key in ["model", "id", "service_tier"] {
+                if let Some(value) = envelope
+                    .get(key)
+                    .filter(|value| value.as_str().is_some_and(|s| !s.is_empty()))
+                {
+                    if metadata.get(key) != Some(value) {
+                        metadata.insert(key.into(), value.clone());
+                    }
+                }
+            }
+            if envelope.get("usage").is_none_or(Value::is_null) {
+                return;
+            }
+        }
+        captured.events.push(event);
     }
 
     /// 完成收集并触发回调
@@ -423,8 +451,12 @@ impl SseUsageCollector {
         }
 
         let events = {
-            let mut guard = self.inner.events.lock().await;
-            std::mem::take(&mut *guard)
+            let mut captured = self.inner.captured.lock().await;
+            let mut events = std::mem::take(&mut captured.events);
+            if let Some(metadata) = captured.codex_metadata.take().filter(|m| !m.is_empty()) {
+                events.insert(0, Value::Object(metadata));
+            }
+            events
         };
 
         let first_token_ms = self
@@ -498,6 +530,7 @@ pub(crate) fn create_usage_collector(
     state: &ProxyState,
     status_code: u16,
     parser_config: &UsageParserConfig,
+    require_billable_tokens: bool,
 ) -> Option<SseUsageCollector> {
     let logging_enabled = state
         .config
@@ -522,84 +555,91 @@ pub(crate) fn create_usage_collector(
     // CLAUDE_PARSER_CONFIG（app_type_str="claude"），按 parser_config 记账会把
     // claude-desktop 的行错记到 claude 名下，导致供应商计价覆盖解析不到。
     let app_type_str = ctx.app_type_str;
-    let tag = ctx.tag;
+    let outbound_service_tier = ctx.outbound_service_tier.clone();
     let start_time = ctx.start_time;
     let stream_parser = parser_config.stream_parser;
     let model_extractor = parser_config.model_extractor;
     let session_id = ctx.session_id.clone();
 
+    let filter: Option<StreamUsageEventFilter> = if app_type_str == "codex" {
+        Some(|data| {
+            super::handler_config::codex_stream_usage_event_filter(data)
+                || data.contains("\"model\"")
+                || data.contains("\"service_tier\"")
+        })
+    } else {
+        parser_config.stream_event_filter
+    };
     Some(SseUsageCollector::new(
         start_time,
-        parser_config.stream_event_filter,
+        filter,
+        app_type_str == "codex",
         move |events, first_token_ms| {
-            if let Some(usage) = stream_parser(&events) {
-                let model = model_extractor(&events, &fallback_model);
-                let latency_ms = start_time.elapsed().as_millis() as u64;
-
-                let state = state.clone();
-                let provider_id = provider_id.clone();
-                let session_id = session_id.clone();
-                let request_model = request_model.clone();
-                let outbound_model = fallback_model.clone();
-
-                tokio::spawn(async move {
-                    log_usage_internal(
-                        &state,
-                        &provider_id,
-                        multiplier,
-                        app_type_str,
-                        &model,
-                        &request_model,
-                        &outbound_model,
-                        usage,
-                        latency_ms,
-                        first_token_ms,
-                        true, // is_streaming
-                        status_code,
-                        Some(session_id),
-                    )
-                    .await;
-                });
-            } else {
-                let model = model_extractor(&events, &fallback_model);
-                let latency_ms = start_time.elapsed().as_millis() as u64;
-                let state = state.clone();
-                let provider_id = provider_id.clone();
-                let session_id = session_id.clone();
-                let request_model = request_model.clone();
-                let outbound_model = fallback_model.clone();
-
-                tokio::spawn(async move {
-                    log_usage_internal(
-                        &state,
-                        &provider_id,
-                        multiplier,
-                        app_type_str,
-                        &model,
-                        &request_model,
-                        &outbound_model,
-                        TokenUsage::default(),
-                        latency_ms,
-                        first_token_ms,
-                        true, // is_streaming
-                        status_code,
-                        Some(session_id),
-                    )
-                    .await;
-                });
-                log::debug!("[{tag}] 流式响应缺少 usage 统计，跳过消费记录");
+            let usage = stream_parser(&events).unwrap_or_default();
+            if require_billable_tokens && !usage.has_billable_tokens() {
+                return;
             }
+            let model = model_extractor(&events, &fallback_model);
+            let service_tier = selected_service_tier(
+                app_type_str,
+                events.first(),
+                outbound_service_tier.as_deref(),
+            );
+            let latency_ms = start_time.elapsed().as_millis() as u64;
+            let state = state.clone();
+            let provider_id = provider_id.clone();
+            let session_id = session_id.clone();
+            let request_model = request_model.clone();
+            let outbound_model = fallback_model.clone();
+
+            tokio::spawn(async move {
+                log_usage_internal(
+                    &state,
+                    &provider_id,
+                    multiplier,
+                    app_type_str,
+                    &model,
+                    &request_model,
+                    &outbound_model,
+                    service_tier,
+                    usage,
+                    latency_ms,
+                    first_token_ms,
+                    true,
+                    status_code,
+                    Some(session_id),
+                )
+                .await;
+            });
         },
     ))
 }
 
+fn selected_service_tier(
+    app_type: &str,
+    response: Option<&Value>,
+    outbound: Option<&str>,
+) -> Option<&'static str> {
+    if app_type != "codex" {
+        return None;
+    }
+    let returned = response.and_then(|v| {
+        v.get("service_tier")
+            .and_then(Value::as_str)
+            .or_else(|| v.pointer("/data/service_tier").and_then(Value::as_str))
+    });
+    returned
+        .or(outbound)
+        .and_then(super::usage::calculator::normalize_codex_service_tier)
+}
+
 /// 异步记录使用量
-fn spawn_log_usage(
+pub(crate) fn spawn_log_usage(
     state: &ProxyState,
     ctx: &RequestContext,
     usage: TokenUsage,
     model: &str,
-    request_model: &str,
+    response: Option<&Value>,
     status_code: u16,
     is_streaming: bool,
 ) {
@@ -615,7 +655,12 @@ fn spawn_log_usage(
     let multiplier = crate::provider::billing_multiplier(&ctx.provider);
     let app_type_str = ctx.app_type_str.to_string();
     let model = model.to_string();
-    let request_model = request_model.to_string();
+    let request_model = ctx.request_model.clone();
+    let service_tier = selected_service_tier(
+        ctx.app_type_str,
+        response,
+        ctx.outbound_service_tier.as_deref(),
+    );
     // 「按请求计价」模式的锚点：映射后的出站模型，无映射时等于 request_model
     let outbound_model = ctx
         .outbound_model
@@ -633,6 +678,7 @@ fn spawn_log_usage(
             &model,
             &request_model,
             &outbound_model,
+            service_tier,
             usage,
             latency_ms,
             None,
@@ -659,7 +705,7 @@ pub(crate) fn usage_logging_enabled(state: &ProxyState) -> bool {
 /// 「按代理发出的请求计价、不信任上游回显」，接管场景下发出的请求模型是
 /// 映射后的 Y 而非客户端别名 X，按 X 计价会用错定价表行。
 #[allow(clippy::too_many_arguments)]
-async fn log_usage_internal(
+pub(crate) async fn log_usage_internal(
     state: &ProxyState,
     provider_id: &str,
     multiplier: rust_decimal::Decimal,
@@ -667,6 +713,7 @@ async fn log_usage_internal(
     model: &str,
     request_model: &str,
     outbound_model: &str,
+    service_tier: Option<&'static str>,
     usage: TokenUsage,
     latency_ms: u64,
     first_token_ms: Option<u64>,
@@ -676,6 +723,9 @@ async fn log_usage_internal(
 ) {
     use super::usage::logger::UsageLogger;
 
+    if !usage_logging_enabled(state) {
+        return;
+    }
     let dedup_scope = super::usage::parser::dedup_scope_for_app(app_type, provider_id);
     let request_id = usage.dedup_request_id(dedup_scope);
 
@@ -716,6 +766,7 @@ async fn log_usage_internal(
             model,
             request_model,
             pricing_model,
+            service_tier,
             usage,
             latency_ms,
             first_token_ms,
@@ -924,6 +975,123 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
+    async fn codex_proxy_prices_returned_model_and_tier_across_streams_and_json() {
+        use crate::proxy::handler_config::CODEX_PARSER_CONFIG;
+        use http_body_util::BodyExt;
+        use rusqlite::OptionalExtension;
+        use serde_json::json;
+
+        let db = Arc::new(Database::memory().unwrap());
+        let state = build_state(db.clone());
+        let provider =
+            crate::provider::Provider::with_id("test".into(), "Test".into(), json!({}), None);
+        let mut ctx = RequestContext::new(
+            &state,
+            &json!({}),
+            &HeaderMap::new(),
+            AppType::Codex,
+            "Codex",
+            "codex",
+            Some(crate::mode::stack::StackTarget {
+                provider,
+                original_model: "client-alias".into(),
+                upstream_model: "routed-model".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        ctx.outbound_model = Some("routed-model".into());
+        ctx.outbound_service_tier = Some("ultrafast".into());
+        db.conn.lock().unwrap().execute_batch(
+            "INSERT OR REPLACE INTO model_pricing (model_id, display_name, input_cost_per_million, output_cost_per_million)
+             VALUES ('gpt-6-astra', 'Test', '2', '0')"
+        ).unwrap();
+
+        for (id, streamed, first_tier, final_tier, tier, expected_cost) in [
+            ("missing", false, None, None, Some("ultrafast"), 12),
+            (
+                "downgrade",
+                false,
+                Some("standard"),
+                None,
+                Some("default"),
+                2,
+            ),
+            ("unknown", false, Some("auto"), None, None, 2),
+            (
+                "early-tier",
+                true,
+                Some("standard"),
+                None,
+                Some("default"),
+                2,
+            ),
+            (
+                "final-tier",
+                true,
+                Some("standard"),
+                Some("ultrafast"),
+                Some("ultrafast"),
+                12,
+            ),
+        ] {
+            let mut envelope = json!({"id":id, "model":"gpt-6-astra"});
+            if let Some(tier) = first_tier {
+                envelope["service_tier"] = json!(tier);
+            }
+            let usage = json!({"input_tokens":1_000_000, "output_tokens":0});
+            let mut headers = HeaderMap::new();
+            let body = if streamed {
+                headers.insert("content-type", "text/event-stream".parse().unwrap());
+                let created = json!({"type":"response.created","response":envelope});
+                let mut completed =
+                    json!({"type":"response.completed","response":{"id":id,"usage":usage}});
+                if let Some(tier) = final_tier {
+                    completed["response"]["service_tier"] = json!(tier);
+                }
+                format!("data: {created}\n\ndata: {completed}\n\n")
+            } else {
+                envelope["usage"] = usage;
+                envelope.to_string()
+            };
+            let upstream =
+                ProxyResponse::buffered(http::StatusCode::OK, headers, Bytes::from(body));
+            let result =
+                process_response(upstream, &ctx, &state, &CODEX_PARSER_CONFIG, streamed, None)
+                    .await
+                    .unwrap();
+            result.into_body().collect().await.unwrap();
+
+            let request_id = format!("session:codex:test:{id}");
+            let recorded = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let row = db.conn.lock().unwrap().query_row(
+                        "SELECT model, request_model, service_tier, total_cost_usd FROM proxy_request_logs WHERE request_id=?1",
+                        [&request_id],
+                        |r| Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, String>(3)?,
+                        )),
+                    ).optional().unwrap();
+                    if let Some(row) = row {
+                        break row;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.expect("proxy wrote usage");
+            assert_eq!(recorded.0, "gpt-6-astra");
+            assert_eq!(recorded.1, "client-alias");
+            assert_eq!(recorded.2.as_deref(), tier);
+            assert_eq!(
+                recorded.3.parse::<Decimal>().unwrap(),
+                Decimal::from(expected_cost)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn billing_multiplier_request_snapshot_survives_provider_change_and_delete(
     ) -> Result<(), AppError> {
         let db = Arc::new(Database::memory()?);
@@ -937,7 +1105,9 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        let selected = db.get_provider_by_id("snapshot", "claude")?.unwrap();
+        let selected = db
+            .get_provider_by_id("snapshot", &AppType::Claude)?
+            .unwrap();
         let multiplier = crate::provider::billing_multiplier(&selected);
         let state = build_state(db.clone());
         for (index, mutation) in [
@@ -959,6 +1129,7 @@ mod tests {
                 "resp-model",
                 "resp-model",
                 "resp-model",
+                None,
                 TokenUsage {
                     input_tokens: 1000000,
                     message_id: Some(format!("snapshot-{index}")),
@@ -1017,6 +1188,7 @@ mod tests {
         let collector = SseUsageCollector::new(
             start,
             Some(super::super::handler_config::codex_stream_usage_event_filter),
+            true,
             move |events, first_token_ms| {
                 *recorded_in_cb.lock().unwrap() = Some((
                     events.len(),
@@ -1336,6 +1508,7 @@ mod tests {
             "resp-model",
             "req-model",
             "req-model",
+            None,
             usage,
             10,
             None,
@@ -1405,6 +1578,7 @@ mod tests {
             "resp-model",
             "req-model",
             "outbound-model",
+            None,
             usage,
             10,
             None,
@@ -1502,6 +1676,7 @@ mod tests {
                 "resp-model",
                 "req-model",
                 "req-model",
+                None,
                 usage,
                 10,
                 None,
@@ -1554,6 +1729,7 @@ mod tests {
         let collector = SseUsageCollector::new(
             std::time::Instant::now(),
             GEMINI_PARSER_CONFIG.stream_event_filter,
+            false,
             {
                 let collected = collected.clone();
                 move |events, _| {

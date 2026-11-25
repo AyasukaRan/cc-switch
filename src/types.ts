@@ -182,6 +182,8 @@ export interface ProviderMeta {
   custom_endpoints?: Record<string, CustomEndpoint>;
   // 是否在切换/同步到 live 时应用通用配置片段
   commonConfigEnabled?: boolean;
+  /** Direct Codex switches use the complete config.toml stored on this provider. */
+  codexFullConfig?: boolean;
   // Claude Desktop 3P 配置写入模式
   claudeDesktopMode?: "direct" | "proxy";
   // Claude Desktop 本地路由模式：Claude-safe route -> upstream model
@@ -446,6 +448,8 @@ export interface Settings {
   nativeTrayMenu?: boolean;
   // Preserve Codex ChatGPT login in auth.json when switching third-party providers
   preserveCodexOfficialAuthOnSwitch?: boolean;
+  /** New custom providers use this template when the local config.toml is missing. */
+  codexCustomTemplate?: string;
   codexQuotaProtection?: {
     enabled: boolean;
     fiveHourThreshold: number;

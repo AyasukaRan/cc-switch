@@ -136,12 +136,25 @@ impl TomlEdits {
             (current != change.before && current != after).then(|| change.path.join("."))
         })?;
         for change in accepted {
-            match &change.after {
-                Some(item) => insert_at(doc, &change.path, item.clone()),
-                None => remove_at(doc, &change.path),
-            }
+            change.apply(doc);
         }
         Ok(())
+    }
+
+    /// Save only the fields the user changed to a new provider's document.
+    pub(crate) fn store_in(&self, doc: &mut DocumentMut) {
+        for change in &self.changes {
+            change.apply(doc);
+        }
+    }
+}
+
+impl Change {
+    fn apply(&self, doc: &mut DocumentMut) {
+        match &self.after {
+            Some(item) => insert_at(doc, &self.path, item.clone()),
+            None => remove_at(doc, &self.path),
+        }
     }
 }
 

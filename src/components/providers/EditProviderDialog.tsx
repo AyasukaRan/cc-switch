@@ -27,6 +27,7 @@ import type {
 import { useLiveEditConflict } from "@/components/providers/LiveEditConflictDialog";
 import { toastEditorViewFailed } from "@/components/providers/forms/hooks/useDraftEditorProjection";
 import { appHas } from "@/config/appSpecs";
+import { extractErrorMessage } from "@/utils/errorUtils";
 
 interface EditProviderDialogProps {
   open: boolean;
@@ -116,6 +117,9 @@ export function EditProviderDialog({
 
   // 使用 ref 标记是否已经加载过，防止重复读取覆盖用户编辑
   const [hasLoadedLive, setHasLoadedLive] = useState(false);
+  const [fullConfigReadError, setFullConfigReadError] = useState<string | null>(
+    null,
+  );
 
   // Claude：底部 JSON 显示「切到这个供应商之后 settings.json 的样子」，保存时拿它做三方比较。
   const [editorView, setEditorView] = useState<ProviderEditorView | null>(null);
@@ -141,6 +145,7 @@ export function EditProviderDialog({
         setLiveSettings(null);
         setEditorView(null);
         setHasLoadedLive(false);
+        setFullConfigReadError(null);
         return;
       }
 
@@ -169,7 +174,13 @@ export function EditProviderDialog({
           if (!cancelled) {
             setEditorView(null);
             setLiveSettings(null);
-            toastEditorViewFailed(t, error);
+            if (appId === "codex" && provider.meta?.codexFullConfig) {
+              setFullConfigReadError(
+                extractErrorMessage(error) || String(error),
+              );
+            } else {
+              toastEditorViewFailed(t, error);
+            }
           }
         } finally {
           if (!cancelled) {
@@ -318,12 +329,13 @@ export function EditProviderDialog({
         ...(values.meta ? { meta: values.meta } : {}),
       };
 
+      const editorBase = values.codexEditorBase ?? editorView?.settings;
       const submit = async (onConflict: EditorConflictPolicy) => {
         await onSubmit({
           provider: updatedProvider,
           originalId: provider.id,
-          ...(editorView
-            ? { editorSave: { base: editorView.settings, onConflict } }
+          ...(editorBase
+            ? { editorSave: { base: editorBase, onConflict } }
             : {}),
         });
         closeDialog();
@@ -398,7 +410,9 @@ export function EditProviderDialog({
             form="provider-form"
             variant="solid"
             size="regular"
-            disabled={isFormSubmitting || !isFormReady}
+            disabled={
+              isFormSubmitting || !isFormReady || fullConfigReadError !== null
+            }
           >
             {isFormSubmitting && <Loader2 className="h-4 w-4 animate-spin" />}
             {t("common.save")}
@@ -407,7 +421,23 @@ export function EditProviderDialog({
       }
     >
       {currentNotice}
-      {waitingForEditorView ? (
+      {fullConfigReadError !== null ? (
+        <div className="space-y-2">
+          <p role="alert" className="text-sm text-danger-text">
+            config.toml · {fullConfigReadError}
+          </p>
+          <Button
+            type="button"
+            variant="neutral"
+            onClick={() => {
+              setFullConfigReadError(null);
+              setHasLoadedLive(false);
+            }}
+          >
+            {t("common.retry")}
+          </Button>
+        </div>
+      ) : waitingForEditorView ? (
         <div className="py-12 text-center text-body text-fg-2">
           {t("common.loading")}
         </div>
@@ -422,6 +452,13 @@ export function EditProviderDialog({
           onSubmittingChange={setIsFormSubmitting}
           onSubmitReadyChange={handleSubmitReadyChange}
           initialData={initialData}
+          storedCodexConfig={
+            appId === "codex"
+              ? typeof provider.settingsConfig?.config === "string"
+                ? provider.settingsConfig.config
+                : ""
+              : undefined
+          }
           showButtons={false}
           isProxyTakeover={isProxyTakeover}
           inactiveFields={editorView?.inactive}

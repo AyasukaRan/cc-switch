@@ -14,6 +14,7 @@ import {
   sanitizeDir,
 } from "@/config/directoryApps";
 import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
+import { CodexTemplateSettings } from "@/components/settings/CodexTemplateSettings";
 import { APP_DISPLAY_NAME, AppGlyph } from "@/components/shell/AppGlyph";
 import {
   SettingsBlock,
@@ -136,11 +137,19 @@ export function AppConfigSection({
               </>
             )}
             {app === "codex" && (
-              <CodexAuthSettings
-                settings={settings}
-                onChange={onAutoSave}
-                codexConfigDir={savedSettings?.codexConfigDir}
-              />
+              <>
+                <CodexTemplateSettings
+                  template={savedSettings?.codexCustomTemplate}
+                  onSave={(codexCustomTemplate) =>
+                    onAutoSave({ codexCustomTemplate })
+                  }
+                />
+                <CodexAuthSettings
+                  settings={settings}
+                  onChange={onAutoSave}
+                  codexConfigDir={savedSettings?.codexConfigDir}
+                />
+              </>
             )}
             {directoryRow(app)}
           </SettingsCard>

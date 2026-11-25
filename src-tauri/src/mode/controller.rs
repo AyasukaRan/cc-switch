@@ -93,7 +93,11 @@ fn attached_route(
 /// 客户端文件现在对应的是谁。
 enum LiveNow {
     /// 直连投影（或还没写过任何东西）。
-    Direct(Option<Provider>),
+    Direct {
+        provider: Option<Provider>,
+        /// Only a user-initiated ENTER can acknowledge a locally edited full file.
+        accepted_codex_file: Option<String>,
+    },
     /// 代理契约；`route` 是写入契约时的路由供应商。
     Proxy {
         contract: Option<Contract>,
@@ -114,14 +118,17 @@ impl LiveNow {
                 route,
             })
         } else {
-            Ok(Self::Direct(direct_provider(state, app)?))
+            Ok(Self::Direct {
+                provider: direct_provider(state, app)?,
+                accepted_codex_file: None,
+            })
         }
     }
 
     /// live 里现在由哪个供应商带进来的独有字段。
     fn claude_exclusive_owner(&self) -> Option<ClaudeProjection> {
         match self {
-            Self::Direct(provider) => provider
+            Self::Direct { provider, .. } => provider
                 .as_ref()
                 .map(|provider| ClaudeProjection::of(&provider.settings_config)),
             Self::Proxy {
@@ -148,7 +155,7 @@ impl LiveNow {
     /// live 现在是哪个直连供应商写进去的（Grok 在没有写入记录时据此推断要删的表）。
     fn direct_owner(&self) -> Option<&Provider> {
         match self {
-            Self::Direct(provider) => provider.as_ref(),
+            Self::Direct { provider, .. } => provider.as_ref(),
             Self::Proxy { .. } => None,
         }
     }
@@ -156,7 +163,7 @@ impl LiveNow {
     /// Codex 的 live 现在是谁写进去的。
     fn codex_owner(&self) -> Owner<'_> {
         match self {
-            Self::Direct(provider) => provider.as_ref().map_or(Owner::None, Owner::Provider),
+            Self::Direct { provider, .. } => provider.as_ref().map_or(Owner::None, Owner::Provider),
             Self::Proxy {
                 contract: Some(contract),
                 route,
@@ -459,7 +466,30 @@ async fn write_proxy(
             codex_direct::prepare_official_rows(&state.db, &owner, &spec, &mut prepared)
                 .await
                 .map_err(err)?;
-            let planned = codex_direct::plan(&state.db, &owner, &spec, &prepared).map_err(err)?;
+            let mut planned =
+                codex_direct::plan(&state.db, &owner, &spec, &prepared).map_err(err)?;
+            if let LiveNow::Direct {
+                provider: Some(direct),
+                accepted_codex_file,
+            } = live_now
+            {
+                planned.expected_live = if op_name == op::ATTACH && direct.uses_codex_full_config()
+                {
+                    // An imported direct card may have no ownership snapshot here. Startup
+                    // may reattach only the exact file the card already knows about.
+                    let disk =
+                        crate::codex_config::read_optional_codex_config_text().map_err(err)?;
+                    if disk
+                        .as_deref()
+                        .is_some_and(|text| direct.settings_config["config"].as_str() != Some(text))
+                    {
+                        return Err("Codex config.toml 在 CC Switch 关闭时有改动，已保留本地文件。可手动开启路由以使用它。 (Codex config.toml was edited while CC Switch was closed. The local file was preserved; enable routing manually to use it.)".into());
+                    }
+                    disk
+                } else {
+                    accepted_codex_file.clone()
+                };
+            }
             let unchanged = !force && live_now.has_contract(&planned.contract.key);
             target.contract = Some(planned.contract.clone());
             let pending = pending(target);
@@ -788,6 +818,22 @@ async fn enter_locked(
         state.proxy_service.start().await?;
     }
     let mode = current::mode_state(app);
+    let mut live_now = LiveNow::of(state, app, &mode)?;
+    if *app == AppType::Codex && op_name == op::ENTER {
+        if let LiveNow::Direct {
+            provider: Some(current),
+            accepted_codex_file,
+        } = &mut live_now
+        {
+            if let Some(disk) =
+                crate::services::provider::codex_full_config::adopt_active(&state.db, current)
+                    .map_err(err)?
+            {
+                current.settings_config["config"] = serde_json::Value::String(disk.clone());
+                *accepted_codex_file = Some(disk);
+            }
+        }
+    }
     let saved_route = match explicit_route {
         Some(route) => Some(route),
         None => route_provider(state, app, &mode)?,
@@ -802,13 +848,22 @@ async fn enter_locked(
             )
         })?,
     };
+    // The explicit route was fetched before adoption; only replace it if
+    // this operation actually accepted a newer version of that same card.
+    let route = match &live_now {
+        LiveNow::Direct {
+            provider: Some(direct),
+            accepted_codex_file: Some(_),
+        } if direct.id == route.id => direct,
+        _ => &route,
+    };
     let next_stack = match stack_mode {
         Some(on) => {
             let current = settled_stack(app)?;
             let mut next = current.clone();
             next.enabled = on;
             if on {
-                add_default(app, &mut next, &route);
+                add_default(app, &mut next, route);
             }
             (next != current).then_some(next)
         }
@@ -817,12 +872,11 @@ async fn enter_locked(
     // 只给日志用，读不到不拦着进入。
     let was_stack = settled_stack(app).is_ok_and(|stack| stack.enabled);
     let stack_on = stack_mode.unwrap_or(was_stack);
-    let live_now = LiveNow::of(state, app, &mode)?;
     let rewritten = write_proxy(
         state,
         app,
         op_name,
-        &route,
+        route,
         &live_now,
         ModeState {
             mode: Some(Mode::Proxy),
@@ -841,8 +895,8 @@ async fn enter_locked(
         route.id,
         rewrite_label(rewritten)
     );
-    state.proxy_service.set_active_target(app, &route).await;
-    warn_if_official_route(state, app, &route).await;
+    state.proxy_service.set_active_target(app, route).await;
+    warn_if_official_route(state, app, route).await;
     spawn_loopback_check(state, app, op_name == op::ENTER);
     Ok(())
 }
@@ -1826,7 +1880,10 @@ async fn startup_app(state: &AppState, app: &AppType) -> Result<(), String> {
                 route: route_provider(state, app, &mode)?,
             }
         } else {
-            LiveNow::Direct(direct_provider(state, app)?)
+            LiveNow::Direct {
+                provider: direct_provider(state, app)?,
+                accepted_codex_file: None,
+            }
         };
         write_direct(
             state,
@@ -5812,7 +5869,7 @@ model_provider = "c"
 
     #[tokio::test]
     #[serial]
-    async fn codex_add_dialog_saves_key_fields_to_the_row_and_global_edits_to_live() {
+    async fn codex_add_dialog_keeps_key_fields_and_edited_globals_on_the_new_card() {
         let _home = Home::new();
         set_preservation(true);
         seed_codex(CODEX_USER_LIVE, None);
@@ -5833,7 +5890,7 @@ model_provider = "c"
         add_from_editor(&state, AppType::Codex, draft, edited, view.settings).expect("add c");
 
         let live = codex_text();
-        assert!(live.contains("approval_policy = \"never\""), "{live}");
+        assert_eq!(live, CODEX_USER_LIVE);
         assert_eq!(codex_doc()["model"].as_str(), Some("gpt-a"), "{live}");
         let c = state
             .db
@@ -5842,13 +5899,48 @@ model_provider = "c"
             .unwrap();
         let c_config = c.settings_config["config"].as_str().unwrap();
         assert!(
-            c_config.contains("gpt-c") && !c_config.contains("approval_policy"),
+            c_config.contains("gpt-c")
+                && c_config.contains("approval_policy = \"never\"")
+                && !c_config.contains("mcp_servers"),
             "{c_config}"
         );
         assert_eq!(
             c.meta.as_ref().and_then(|meta| meta.common_config_enabled),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn codex_add_dialog_leaves_a_missing_active_file_for_the_current_provider() {
+        let _home = Home::new();
+        set_preservation(true);
+        seed_codex(CODEX_USER_LIVE, None);
+        let state = state_with(AppType::Codex, &codex_a_b(), "a").await;
+        let draft = codex_row("c", "https://c.example/v1", "");
+        let view =
+            ProviderService::editor_view(&state, AppType::Codex, &draft.settings_config, None)
+                .expect("preview new card");
+        let mut edited = view.settings.clone();
+        let config = edited["config"]
+            .as_str()
+            .unwrap()
+            .replace("\"on-request\"", "\"never\"");
+        edited["config"] = json!(config);
+        let path = crate::codex_config::get_codex_config_path();
+        std::fs::remove_file(&path).unwrap();
+
+        add_from_editor(&state, AppType::Codex, draft, edited, view.settings).unwrap();
+        assert!(!path.exists());
+        let new_card = state
+            .db
+            .get_provider_by_id("c", &AppType::Codex)
+            .unwrap()
+            .unwrap();
+        assert!(new_card.settings_config["config"]
+            .as_str()
+            .unwrap()
+            .contains("approval_policy = \"never\""));
     }
 
     /// 新增对话框的底已经套了预设：预设带的独有字段归新供应商，live 里用户自己写的不归它。
@@ -9245,10 +9337,10 @@ model_provider = "c"
         );
     }
 
-    /// 新增第一个供应商会同时写进 live：没填 Key 照样拒绝，行不留。
+    /// 有本地配置时，新增只存卡；主动切换时才校验用于直连的凭据。
     #[tokio::test]
     #[serial]
-    async fn codex_adding_a_keyless_first_provider_is_refused() {
+    async fn codex_adding_a_first_provider_keeps_an_existing_local_file() {
         let _home = Home::new();
         set_preservation(true);
         seed_codex("model = \"gpt-5.4\"\n", Some(&chatgpt_login("acct")));
@@ -9259,14 +9351,15 @@ model_provider = "c"
             .expect("view")
             .settings;
         let draft = Provider::with_id("c".into(), "C".into(), template, None);
-        let err = add_from_editor(&state, AppType::Codex, draft, base.clone(), base)
-            .expect_err("a keyless first provider would go live");
-        assert!(err.to_string().contains("requires_openai_auth"), "{err}");
+        add_from_editor(&state, AppType::Codex, draft, base.clone(), base)
+            .expect("store an inactive card without replacing config.toml");
         assert!(state
             .db
             .get_provider_by_id("c", &AppType::Codex)
             .unwrap()
-            .is_none());
+            .is_some());
+        assert!(direct(&state, &AppType::Codex).is_none());
+        assert!(ProviderService::switch(&state, AppType::Codex, "c").is_err());
         assert_eq!(codex_text(), before);
     }
 }

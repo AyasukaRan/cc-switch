@@ -925,6 +925,11 @@
       "resumedToast": "Official login resumed. Fully quit and reopen Codex for it to take effect",
       "saveFailed": "Failed to save: {{error}}"
     },
+    "codexTemplate": {
+      "title": "Default config.toml for new providers",
+      "help": "New custom providers start with your local config.toml. This template is used when the file is missing. Save an empty template to start with a blank file.",
+      "restore": "Restore built-in template"
+    },
     "preserveCodexOfficialAuthOnSwitch": "Keep official login for direct switches",
     "preserveCodexOfficialAuthOnSwitchDescription": "Controls third-party switches when local routing is off. Takeover routing always preserves the Codex official login.",
     "unifyCodexSessionHistory": "Unified Codex session history",
@@ -1009,7 +1014,7 @@
     "upToDate": "Up to Date",
     "aboutHint": "View version information and update status.",
     "portableMode": "Portable mode: updates require manual download.",
-    "portableUpdateHint": "Portable mode: the button above downloads the new zip. Extract it and replace your existing cc-switch.exe. Your settings and data live in .cc-switch under your user folder and are not affected.",
+    "portableUpdateHint": "Open the custom release page to see which portable packages are available for this version.",
     "updateAvailable": "New version available: {{version}}",
     "updateBadge": "Update available",
     "updateFailed": "Update installation failed, attempted to open download page.",
@@ -2160,6 +2165,8 @@
     "empty": "No endpoints"
   },
   "codexConfig": {
+    "fullConfig": "Use a complete config.toml",
+    "fullConfigHint": "Switching to this provider in direct mode writes its config.toml. Saving edits to the active direct provider updates the local file immediately. Adding a provider or editing an inactive full configuration saves only the card. Include third-party credentials in the file, for example with env_key. Routing and Aggregation modes use CC Switch routing.",
     "authJson": "auth.json (JSON) *",
     "authJsonPlaceholder": "{\n  \"OPENAI_API_KEY\": \"sk-your-api-key-here\"\n}",
     "authJsonHint": "Codex auth.json configuration content",
@@ -2493,6 +2500,7 @@
     "noPricingData": "No pricing data. Click \"Add\" to add model pricing configuration.",
     "model": "Model",
     "pricingModel": "Pricing Model",
+    "serviceTier": "Service tier",
     "displayName": "Display Name",
     "inputCost": "Input Cost",
     "outputCost": "Output Cost",

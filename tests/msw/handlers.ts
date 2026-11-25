@@ -122,6 +122,8 @@ export const handlers = [
     return success(true);
   }),
 
+  http.post(`${TAURI_ENDPOINT}/get_codex_local_config`, () => success(null)),
+
   http.post(`${TAURI_ENDPOINT}/add_provider`, async ({ request }) => {
     const { provider, app } = await withJson<{
       provider: Provider & { id?: string };

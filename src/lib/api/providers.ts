@@ -98,6 +98,10 @@ export interface WorkBuddyModelOwner {
 }
 
 export const providersApi = {
+  async getCodexLocalConfig(): Promise<string | null> {
+    return await invoke("get_codex_local_config");
+  },
+
   async getAll(appId: AppId): Promise<Record<string, Provider>> {
     return await invoke("get_providers", { app: appId });
   },

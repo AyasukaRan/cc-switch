@@ -477,6 +477,26 @@ impl Database {
         Ok(())
     }
 
+    pub(crate) fn adopt_codex_config_text(
+        &self,
+        id: &str,
+        previous: Option<&str>,
+        text: &str,
+    ) -> Result<(), AppError> {
+        let conn = lock_conn!(self.conn);
+        let changed = conn.execute(
+            "UPDATE providers SET settings_config = json_set(settings_config, '$.config', ?1)
+             WHERE id = ?2 AND app_type = 'codex' AND json_extract(settings_config, '$.config') IS ?3",
+            params![text, id, previous],
+        ).map_err(|e| AppError::Database(e.to_string()))?;
+        if changed == 0 {
+            return Err(AppError::Conflict(
+                "The Codex provider changed while adopting config.toml".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn update_provider_settings_config(
         &self,
         app_type: &AppType,

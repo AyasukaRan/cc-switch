@@ -130,7 +130,9 @@ function skipPermissionsFlag(appId: AppId): string {
 
 /** Codex 卡自己带路由表（第三方地址），终端能只对这一次用 `-c` 换成它 */
 function codexHasOwnRoute(provider: Provider): boolean {
-  if (provider.category === "official") return false;
+  // A complete file cannot be reproduced by merging individual -c overrides.
+  if (provider.category === "official" || provider.meta?.codexFullConfig)
+    return false;
   if (providerNeedsRouting("codex", provider)) return false;
   const config = (provider.settingsConfig as { config?: unknown } | undefined)
     ?.config;

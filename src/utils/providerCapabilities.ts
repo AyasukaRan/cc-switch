@@ -193,6 +193,13 @@ export function providerNeedsRouting(
 
   // 托管 OAuth：凭据由代理注入，与 apiFormat 无关，必须接管。
   if (isManagedOAuth) return true;
+  // The full TOML defines the direct connection. apiFormat and isFullUrl configure the proxy.
+  if (
+    appId === "codex" &&
+    provider.meta?.codexFullConfig &&
+    provider.meta.authBinding?.source !== "managed_account"
+  )
+    return false;
 
   if (appId === "claude") {
     const fmt = provider.meta?.apiFormat;

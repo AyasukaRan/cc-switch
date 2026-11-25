@@ -17,12 +17,56 @@ pub struct CostBreakdown {
 }
 
 /// 模型定价信息
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelPricing {
     pub input_cost_per_million: Decimal,
     pub output_cost_per_million: Decimal,
     pub cache_read_cost_per_million: Decimal,
     pub cache_creation_cost_per_million: Decimal,
+}
+
+pub(crate) fn normalize_codex_service_tier(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "default" | "standard" => Some("default"),
+        "fast" | "priority" => Some("priority"),
+        "ultrafast" => Some("ultrafast"),
+        "flex" => Some("flex"),
+        _ => None,
+    }
+}
+
+// Ratios to the configured standard token prices. Only apply a tier published
+// for this model: https://developers.openai.com/api/docs/pricing
+fn codex_tier_ratio(model: &str, tier: &str, created_at: i64) -> Option<(u32, u32)> {
+    match (tier, model) {
+        ("ultrafast", "gpt-6.2-astra" | "gpt-6.2-sol") => {
+            // The introductory 3× rate ends 2027-03-01 00:00 Pacific (08:00 UTC).
+            Some((if created_at < 1_803_888_000 { 3 } else { 6 }, 1))
+        }
+        ("ultrafast", "gpt-6-astra" | "gpt-6.1-sol") => Some((6, 1)),
+        ("priority", "gpt-5.5") => Some((5, 2)),
+        ("priority", "gpt-5-mini") => Some((9, 5)),
+        ("priority", "gpt-4.1" | "gpt-4.1-mini" | "o3") => Some((7, 4)),
+        ("priority", "gpt-4o") => Some((17, 10)),
+        ("priority", "gpt-4o-mini") => Some((5, 3)),
+        ("priority", "gpt-6.2-astra" | "gpt-6.2-sol" | "gpt-5.3-codex") => Some((2, 1)),
+        (
+            "flex",
+            "gpt-5.5" | "gpt-5.5-pro" | "gpt-5.4-pro" | "gpt-5.4-nano" | "gpt-5-mini"
+            | "gpt-5-nano" | "o3",
+        ) => Some((1, 2)),
+        (
+            tier,
+            "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6.1-terra" | "gpt-6-sol" | "gpt-6-luna"
+            | "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-5.4"
+            | "gpt-5.4-mini" | "gpt-5.2" | "gpt-5.1" | "gpt-5",
+        ) => match tier {
+            "priority" => Some((2, 1)),
+            "flex" => Some((1, 2)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// 成本计算器
@@ -110,6 +154,42 @@ impl CostCalculator {
 }
 
 impl ModelPricing {
+    /// Apply the recorded service tier to the token prices, independently of
+    /// any provider cost multiplier. Missing and unpriced tiers use the base rate.
+    pub(crate) fn for_codex_request(
+        &self,
+        model: &str,
+        service_tier: Option<&str>,
+        created_at: i64,
+    ) -> Self {
+        let Some(tier) = service_tier.and_then(normalize_codex_service_tier) else {
+            return self.clone();
+        };
+        if tier == "default" {
+            return self.clone();
+        }
+        let candidates = crate::services::usage_stats::model_pricing_candidates(model);
+        let Some((id, (numerator, denominator))) = candidates
+            .iter()
+            .find_map(|id| codex_tier_ratio(id, tier, created_at).map(|ratio| (id, ratio)))
+        else {
+            return self.clone();
+        };
+        let adjust = |rate: Decimal| rate * Decimal::from(numerator) / Decimal::from(denominator);
+        // GPT-5.4 Flex lists $0.13 per million cache reads against a $0.25 base.
+        let cache_read = if id == "gpt-5.4" && tier == "flex" {
+            self.cache_read_cost_per_million * Decimal::new(52, 2)
+        } else {
+            adjust(self.cache_read_cost_per_million)
+        };
+        Self {
+            input_cost_per_million: adjust(self.input_cost_per_million),
+            output_cost_per_million: adjust(self.output_cost_per_million),
+            cache_read_cost_per_million: cache_read,
+            cache_creation_cost_per_million: adjust(self.cache_creation_cost_per_million),
+        }
+    }
+
     /// 从字符串创建定价信息
     pub fn from_strings(
         input: &str,
@@ -129,6 +209,64 @@ impl ModelPricing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_service_prices_follow_the_model_and_request_date() {
+        let prices = ModelPricing::from_strings("8", "40", "0.4", "10").unwrap();
+        for (model, tier, time, factor) in [
+            ("gpt-6.2-astra", "ultrafast", 1_803_887_999, 3),
+            (
+                "openai/gpt-6.2-astra-2026-11-17",
+                "ultrafast",
+                1_803_888_000,
+                6,
+            ),
+            ("gpt-6-astra@high", "ultrafast", 1_800_000_000, 6),
+            ("gpt-6.2-sol", "fast", 1_800_000_000, 2),
+            ("gpt-6.2-sol", "standard", 1_800_000_000, 1),
+            ("custom-relay", "ultrafast", 1_800_000_000, 1),
+            ("gpt-6.1-terra", "ultrafast", 1_800_000_000, 1),
+        ] {
+            let actual = prices.for_codex_request(model, Some(tier), time);
+            let factor = Decimal::from(factor);
+            assert_eq!(
+                actual.input_cost_per_million,
+                prices.input_cost_per_million * factor
+            );
+            assert_eq!(
+                actual.output_cost_per_million,
+                prices.output_cost_per_million * factor
+            );
+            assert_eq!(
+                actual.cache_read_cost_per_million,
+                prices.cache_read_cost_per_million * factor
+            );
+            assert_eq!(
+                actual.cache_creation_cost_per_million,
+                prices.cache_creation_cost_per_million * factor
+            );
+        }
+        assert_eq!(
+            prices
+                .for_codex_request("gpt-6-astra", Some("flex"), 0)
+                .input_cost_per_million,
+            Decimal::from(4)
+        );
+        assert_eq!(
+            ModelPricing::from_strings("0.15", "0.6", "0.075", "0")
+                .unwrap()
+                .for_codex_request("gpt-4o-mini", Some("priority"), 0)
+                .cache_read_cost_per_million,
+            Decimal::new(125, 3)
+        );
+        assert_eq!(
+            ModelPricing::from_strings("2.50", "15", "0.25", "0")
+                .unwrap()
+                .for_codex_request("gpt-5.4-2026-03-05", Some("flex"), 0)
+                .cache_read_cost_per_million,
+            Decimal::new(13, 2)
+        );
+    }
 
     #[test]
     fn test_cost_calculation() {

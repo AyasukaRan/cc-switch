@@ -444,7 +444,7 @@ export function AddProviderDialog({
       const editorBase =
         appId === "claude"
           ? claudeLiveBase && { base: claudeLiveBase }
-          : projectsDraft
+          : projectsDraft && !providerData.meta?.codexFullConfig
             ? draftEditorBase
             : null;
       const submit = async (onConflict: EditorConflictPolicy) => {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { releaseNotesUrl } from "@/lib/releaseLinks";
 import {
-  changelogUrl,
+  WHATS_NEW_ENTRIES,
   entriesSince,
   entriesUpTo,
   isNewerThanSeen,
@@ -87,10 +88,19 @@ describe("language and links", () => {
     expect(resolveWhatsNewLanguage("fr")).toBe("en");
   });
 
-  it("links to the website changelog, Traditional Chinese uses the zh pages", () => {
-    expect(changelogUrl("en", "4.0.2")).toBe(
-      "https://ccswitch.io/en/changelog/4.0.2",
+  it("links to the custom release for a version or lists releases", () => {
+    expect(releaseNotesUrl("v4.0.36")).toBe(
+      "https://github.com/AyasukaRan/cc-switch/releases/tag/custom-v4.0.36",
     );
-    expect(changelogUrl("zh-TW")).toBe("https://ccswitch.io/zh/changelog");
+    expect(releaseNotesUrl()).toBe(
+      "https://github.com/AyasukaRan/cc-switch/releases",
+    );
+  });
+
+  it("shows only summaries published on this channel", () => {
+    expect(WHATS_NEW_ENTRIES.map((entry) => entry.version)).toContain("4.0.36");
+    expect(WHATS_NEW_ENTRIES.every((entry) => entry.channel === "custom")).toBe(
+      true,
+    );
   });
 });

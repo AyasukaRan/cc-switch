@@ -56,7 +56,7 @@ export function useDraftEditorProjection(
       if (!onEditorBaseChange) return;
       const current = ++sequence.current;
       onEditorBaseChange(null);
-      providersApi
+      return providersApi
         .getEditorView(appId, settings, category, undefined, meta)
         .then((view) => {
           if (current !== sequence.current) return;

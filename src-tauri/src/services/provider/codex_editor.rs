@@ -8,6 +8,7 @@
 //!   供应商时，关键字段和独有字段在同一次写入里也换进 live。
 //! - 三方比较：每个改动都带着打开编辑器时的原值，live 里这个键已经被别的程序改成了第三个
 //!   值就算冲突，由用户选保留哪一边。
+//! - 完整配置模式：当前直连卡显示磁盘原文，其他卡显示数据库保存的原文。
 //!
 //! 改动的粒度：顶层的值；顶层表里的每个键（`[mcp_servers.fs]` 这类子表按整张算）；
 //! `[model_providers]` 下 CC Switch 路由表以外的每张表。嵌在用户表里的模型名是关键字段，
@@ -22,13 +23,11 @@ use crate::app_config::AppType;
 use crate::codex_config::get_codex_config_path;
 use crate::database::Database;
 use crate::error::AppError;
-use crate::live::engine::{read_current, LiveFile};
 use crate::live::floor;
-use crate::live::patch::toml::parse;
 use crate::live::project::codex::{
     is_keyless_fallback, CodexProjection, Route, RowInput, OFFICIAL_PROXY_ROUTE_ID, ROUTE_ID,
 };
-use crate::mode::operation::{AppWrite, FileChange};
+use crate::mode::operation::AppWrite;
 use crate::mode::state::{op, PendingTarget};
 use crate::provider::{Provider, ProviderMeta};
 use crate::proxy::providers::codex_oauth_auth::CodexOAuthManager;
@@ -106,18 +105,38 @@ pub fn view(
     settings_config: &Value,
     category: Option<&str>,
     meta: Option<&ProviderMeta>,
+    provider_id: Option<&str>,
 ) -> Result<EditorView, AppError> {
-    let path = get_codex_config_path();
-    let pre = read_current(&path)?;
-    let mut doc = parse(&path, pre.as_deref())?;
-
-    let mut provider =
-        Provider::with_id(String::new(), String::new(), settings_config.clone(), None);
+    let mut provider = Provider::with_id(
+        provider_id.unwrap_or_default().to_owned(),
+        String::new(),
+        settings_config.clone(),
+        None,
+    );
     provider.category = category.map(str::to_string);
     provider.meta = meta.cloned();
+    if provider.uses_codex_full_config() {
+        if provider_id.is_some() {
+            let _guard = crate::mode::controller::lock_settled_blocking(state, &AppType::Codex)?;
+            if let Some(disk) = super::codex_full_config::active_text(&state.db, &provider)? {
+                provider.settings_config["config"] = Value::String(disk);
+            }
+        }
+        return Ok(EditorView {
+            settings: provider.settings_config,
+            inactive: Vec::new(),
+        });
+    }
+
+    let path = get_codex_config_path();
+    let (mut doc, saved_outgoing) = super::codex_full_config::managed_base()?;
     let live_owner = LiveOwner::read(state)?;
     let planned = plan_for_view(&state.db, &live_owner.owner(), &provider)?;
-    planned.config().apply_to(&path, &mut doc)?;
+    let mut patch = planned.config().clone();
+    if let Some(outgoing) = saved_outgoing {
+        patch.outgoing = outgoing;
+    }
+    patch.apply_to(&path, &mut doc)?;
 
     // Key 在 API Key 输入框里（行的 auth），TOML 里不再重复显示。
     let row_key = settings_config
@@ -294,10 +313,11 @@ impl LiveOwner {
 /// 只读 live、按值去掉那一家的，不走投影：投影会校验生效的 profile，而空行不写
 /// `model_provider`，profile 选了路由表就会被当成覆盖路由拒绝。
 pub(crate) fn live_exclusive(state: &AppState) -> Result<Vec<Entry>, AppError> {
-    let path = get_codex_config_path();
-    let pre = read_current(&path)?;
-    let doc = parse(&path, pre.as_deref())?;
-    let owned = codex_direct::outgoing_exclusive(&LiveOwner::read(state)?.owner());
+    let (doc, saved_outgoing) = super::codex_full_config::managed_base()?;
+    let owned = match saved_outgoing {
+        Some(outgoing) => outgoing,
+        None => codex_direct::outgoing_exclusive(&LiveOwner::read(state)?.owner()),
+    };
     Ok(exclusive_entries(&doc)
         .into_iter()
         .filter(|entry| {
@@ -520,7 +540,8 @@ pub(crate) fn write_live(
             let owner = prev.map_or(Owner::None, Owner::Provider);
             let spec = Target::Direct(Some(target));
             let prepared = codex_direct::prepare(manager, &owner, &spec)?;
-            let planned = codex_direct::plan(db, &owner, &spec, &prepared)?;
+            let mut planned = codex_direct::plan(db, &owner, &spec, &prepared)?;
+            planned.create_only = set_pointer;
             codex_direct::run_with_edits(
                 db,
                 if set_pointer { op::SWITCH } else { op::APPLY },
@@ -535,15 +556,8 @@ pub(crate) fn write_live(
             if edits.is_empty() {
                 return Ok(());
             }
-            AppWrite::begin(db, app())?.run(
-                op::APPLY,
-                &[FileChange {
-                    file: LiveFile::private(get_codex_config_path()),
-                    patch: edits,
-                }],
-                PendingTarget::default(),
-            )?;
-            Ok(())
+            let write = AppWrite::begin(db, app())?;
+            super::codex_full_config::write_managed_edits(&write, edits)
         }
     }
 }

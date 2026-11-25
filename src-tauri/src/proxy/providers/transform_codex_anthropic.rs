@@ -1397,6 +1397,9 @@ pub(crate) fn anthropic_response_to_responses_with_context(
         "output": output,
         "usage": usage
     });
+    if let Some(tier) = body.pointer("/usage/service_tier").and_then(Value::as_str) {
+        result["service_tier"] = json!(tier);
+    }
     if let Some(reason) = incomplete_reason {
         result["incomplete_details"] = json!({ "reason": reason });
     }
@@ -2592,6 +2595,7 @@ mod tests {
             "content": [{ "type": "text", "text": "x" }],
             "stop_reason": "end_turn",
             "usage": {
+                "service_tier": "standard",
                 "input_tokens": 20,
                 "output_tokens": 5,
                 "output_tokens_details": {"thinking_tokens": 3},
@@ -2604,6 +2608,7 @@ mod tests {
                 .unwrap();
         // Responses input_tokens is the inclusive total: fresh + read + write.
         assert_eq!(result["usage"]["input_tokens"], 100);
+        assert_eq!(result["service_tier"], "standard");
         assert_eq!(result["usage"]["output_tokens"], 5);
         assert_eq!(
             result["usage"]["output_tokens_details"]["reasoning_tokens"],

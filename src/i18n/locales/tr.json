@@ -925,6 +925,11 @@
       "resumedToast": "Resmî giriş sürdürüldü. Etkili olması için Codex'ten tamamen çıkıp yeniden açın",
       "saveFailed": "Kaydedilemedi: {{error}}"
     },
+    "codexTemplate": {
+      "title": "Yeni sağlayıcılar için varsayılan config.toml",
+      "help": "Yeni özel sağlayıcılar yerel config.toml dosyanızı kullanır. Dosya yoksa bu şablon kullanılır. Boş bir dosyayla başlamak için şablonu boş kaydedin.",
+      "restore": "Yerleşik şablonu geri yükle"
+    },
     "preserveCodexOfficialAuthOnSwitch": "Doğrudan geçişler için resmi giriş bilgilerini koruyun",
     "preserveCodexOfficialAuthOnSwitchDescription": "Yerel yönlendirme kapalıyken üçüncü taraf anahtarları kontrol eder. Devralma yönlendirmesi her zaman Codex resmi giriş bilgilerini korur.",
     "unifyCodexSessionHistory": "Birleşik Codex oturum geçmişi",
@@ -1009,7 +1014,7 @@
     "upToDate": "Güncel",
     "aboutHint": "Sürüm bilgilerini ve güncelleme durumunu görüntüleyin.",
     "portableMode": "Taşınabilir mod: Güncellemeler manuel olarak indirilmeyi gerektirir.",
-    "portableUpdateHint": "Taşınabilir modda yukarıdaki düğme yeni ZIP dosyasını indirir. ZIP'i açıp mevcut cc-switch.exe dosyasını yenisiyle değiştirin. Ayarlarınız ve verileriniz kullanıcı klasörünüzdeki .cc-switch dizininde bulunur ve etkilenmez.",
+    "portableUpdateHint": "Bu sürüm için hangi taşınabilir paketlerin sunulduğunu görmek üzere özel sürüm sayfasını açın.",
     "updateAvailable": "Yeni sürüm mevcut: {{version}}",
     "updateBadge": "Güncelleme mevcut",
     "updateFailed": "Güncelleme yüklemesi başarısız oldu, indirme sayfası açılmaya çalışıldı.",
@@ -2091,6 +2096,8 @@
     "empty": "Uç nokta yok"
   },
   "codexConfig": {
+    "fullConfig": "Tam config.toml dosyasını kullan",
+    "fullConfigHint": "Doğrudan bağlantı modunda bu sağlayıcıya geçince kayıtlı config.toml uygulanır. Etkin doğrudan bağlantı sağlayıcısında yapılan değişiklikler kaydedildiğinde yerel dosya hemen güncellenir. Sağlayıcı eklerken veya etkin olmayan bir tam yapılandırmayı düzenlerken değişiklikler yalnızca karta kaydedilir. Dosyada env_key gibi bir yöntemle üçüncü taraf kimlik doğrulamasını belirtin. Yönlendirme ve Toplama modları CC Switch yönlendirme ayarlarını kullanır.",
     "authJson": "auth.json (JSON) *",
     "authJsonPlaceholder": "{\n  \"OPENAI_API_KEY\": \"sk-your-api-key-here\"\n}",
     "authJsonHint": "Codex auth.json yapılandırma içeriği",
@@ -2424,6 +2431,7 @@
     "noPricingData": "Fiyatlandırma verisi yok. Model fiyatlandırma yapılandırmasını eklemek için \"Ekle\"yi tıklayın.",
     "model": "Model",
     "pricingModel": "Fiyatlandırma Modeli",
+    "serviceTier": "Hizmet katmanı",
     "displayName": "Görünen Ad",
     "inputCost": "Girdi Maliyeti",
     "outputCost": "Çıktı Maliyeti",

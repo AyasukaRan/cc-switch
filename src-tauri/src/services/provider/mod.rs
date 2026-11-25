@@ -9,6 +9,7 @@ pub(crate) mod claude_official;
 pub(crate) mod codex_client_catalog;
 pub(crate) mod codex_direct;
 mod codex_editor;
+pub(crate) mod codex_full_config;
 mod codex_login;
 pub(crate) mod codex_official_models;
 pub(crate) mod codex_terminal;
@@ -414,6 +415,187 @@ mod tests {
             }
             assert!(!crate::codex_config::get_codex_config_path().exists());
             assert!(!crate::codex_config::get_codex_model_catalog_path().exists());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn codex_full_config_editor_keeps_inactive_edits_in_the_provider() {
+        with_test_home(|state, _| {
+            use crate::live::engine::DeviceStore;
+            use crate::mode::state::{self as mode, Mode};
+
+            crate::settings::reload_settings().unwrap();
+            let store = DeviceStore::for_device();
+            mode::update(&store, |state| {
+                state.apps.entry("codex".into()).or_default().mode = Some(Mode::Proxy);
+            })
+            .unwrap();
+            let app = AppType::Codex;
+            let path = crate::codex_config::get_codex_config_path();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let live = "# Local file with an unfinished edit\n[features";
+            fs::write(&path, live).unwrap();
+
+            let config = "# Personal route\r\nmodel_provider = 'relay'\r\n[model_providers.relay]\r\nname = 'Relay'\r\nbase_url = 'https://relay.example/v1'\r\nenv_key = 'RELAY_API_KEY'\r\n\r\n[features]\r\nshell_tool = true\r\n";
+            let mut card = Provider::with_id(
+                "custom-file".into(),
+                "Custom file".into(),
+                json!({"auth": {}, "config": config}),
+                None,
+            );
+            card.meta = Some(ProviderMeta {
+                codex_full_config: Some(true),
+                ..Default::default()
+            });
+            let editor = |base: Value| {
+                Some(EditorSave {
+                    base,
+                    draft: None,
+                    on_conflict: Default::default(),
+                })
+            };
+            ProviderService::add_from_editor(
+                state,
+                app.clone(),
+                card.clone(),
+                true,
+                editor(json!({})),
+            )
+            .expect("adding a full config keeps the proxy contract");
+            let view = ProviderService::editor_view_with_meta(
+                state,
+                app.clone(),
+                &card.settings_config,
+                None,
+                Some(&card.id),
+                None,
+            )
+            .expect("show the saved text even when the live TOML cannot be parsed");
+            assert_eq!(view.settings, card.settings_config);
+            assert!(view.inactive.is_empty());
+            assert_eq!(fs::read_to_string(&path).unwrap(), live);
+            assert!(crate::mode::current::direct_provider(&state.db, &app)
+                .unwrap()
+                .is_none());
+
+            let edited = config.replace(
+                "shell_tool = true",
+                "# kept with this provider\r\nshell_tool = false",
+            );
+            card.settings_config["config"] = json!(edited);
+            ProviderService::update_from_editor(
+                state,
+                app.clone(),
+                None,
+                card.clone(),
+                editor(view.settings),
+            )
+            .expect("save the full config without applying a global edit");
+            let stored = || {
+                state
+                    .db
+                    .get_provider_by_id("custom-file", &app)
+                    .unwrap()
+                    .unwrap()
+                    .settings_config
+            };
+            assert_eq!(stored(), card.settings_config);
+            assert_eq!(fs::read_to_string(&path).unwrap(), live);
+
+            card.settings_config["config"] = json!("[broken");
+            ProviderService::update(state, app.clone(), None, card)
+                .expect_err("non-editor updates validate full config before saving it");
+            assert_eq!(stored()["config"], edited);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn codex_implicit_initialization_refuses_a_newly_created_config() {
+        with_test_home(|state, _| {
+            crate::settings::reload_settings().unwrap();
+            let path = crate::codex_config::get_codex_config_path();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // The initial existence check already saw no file. Codex writes one
+            // before the transaction starts publishing the provider and credentials.
+            let local = "# written while CC Switch was preparing\r\nmodel = 'local'\r\n";
+            fs::write(&path, local).unwrap();
+            let auth_path = crate::codex_config::get_codex_auth_path();
+            let auth = r#"{"OPENAI_API_KEY":"local-key"}"#;
+            fs::write(&auth_path, auth).unwrap();
+            for full in [false, true] {
+                let mut provider = Provider::with_id(
+                    "added".into(),
+                    "Added".into(),
+                    codex_settings("https://relay.example/v1", "stored-key"),
+                    None,
+                );
+                provider.meta = Some(ProviderMeta {
+                    codex_full_config: Some(full),
+                    ..Default::default()
+                });
+                let result = codex_direct::initialize_direct(
+                    &state.db,
+                    &state.codex_oauth_manager,
+                    codex_direct::Owner::None,
+                    &provider,
+                    crate::mode::state::PendingTarget::pointer(Some(provider.id.clone())),
+                );
+                assert!(matches!(result, Err(AppError::Conflict(_))), "{result:?}");
+                assert_eq!(fs::read_to_string(&path).unwrap(), local);
+                assert_eq!(fs::read_to_string(&auth_path).unwrap(), auth);
+                assert!(
+                    crate::mode::current::direct_provider(&state.db, &AppType::Codex)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn codex_full_config_keeps_session_compression_edits_in_the_managed_file() {
+        use crate::services::codex_session_compression::{is_enabled, set_enabled};
+
+        with_test_home(|state, _| {
+            crate::settings::reload_settings().unwrap();
+            let app = AppType::Codex;
+            let path = crate::codex_config::get_codex_config_path();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let managed = "# device\n[features]\nlocal_thread_store_compression = true\npersonal_flag = true\n";
+            fs::write(&path, managed).unwrap();
+            let raw = "# mine\r\nmodel = 'codex'\r\n";
+            let mut card = Provider::with_id(
+                "raw".into(),
+                "Raw".into(),
+                json!({"auth": {}, "config": raw}),
+                None,
+            );
+            card.meta = Some(ProviderMeta {
+                codex_full_config: Some(true),
+                ..Default::default()
+            });
+            ProviderService::add(state, app.clone(), card, true).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), managed);
+            ProviderService::switch(state, app.clone(), "raw").unwrap();
+            assert!(is_enabled().unwrap());
+            assert!(!set_enabled(&state.db, false).unwrap());
+            assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+
+            let mut official = Provider::with_id(
+                "official".into(),
+                "Official".into(),
+                json!({"auth": {}, "config": ""}),
+                None,
+            );
+            official.category = Some("official".into());
+            ProviderService::add(state, app.clone(), official, false).unwrap();
+            ProviderService::switch(state, app, "official").unwrap();
+            let restored = fs::read_to_string(&path).unwrap();
+            assert!(restored.contains("# device") && restored.contains("personal_flag = true"));
+            assert!(!restored.contains("local_thread_store_compression"));
         });
     }
 
@@ -5899,9 +6081,7 @@ impl ProviderService {
         Ok(true)
     }
 
-    /// 新增 Codex 供应商。还没有当前供应商时，它就是第一个：行、live 和指针一起提交，
-    /// live 只写关键字段，不覆盖用户已有的 config.toml。写 live 失败时撤回刚存的行，
-    /// 免得留下一个看得见却用不了的供应商。
+    /// 直连模式下新增首个 Codex 供应商时，行、live 和指针一起提交。代理模式下保持现有契约。
     fn add_codex(state: &AppState, provider: Provider) -> Result<bool, AppError> {
         let app_type = AppType::Codex;
         // 和切换互斥：等着的切换不能看到只存了一半的托管账号绑定。
@@ -5911,7 +6091,10 @@ impl ProviderService {
             &app_type,
             crate::mode::current::Purpose::Direct,
         )?;
-        if current.is_some() {
+        if current.is_some()
+            || crate::mode::current::is_proxy(&app_type)
+            || crate::codex_config::read_optional_codex_config_text()?.is_some()
+        {
             state.db.save_provider(&app_type, &provider)?;
             return Ok(true);
         }
@@ -5920,12 +6103,11 @@ impl ProviderService {
         codex_direct::preflight(state.db.as_ref(), &provider)?;
         let previous = state.db.get_provider_by_id(&provider.id, &app_type)?;
         state.db.save_provider(&app_type, &provider)?;
-        let written = codex_direct::write_direct(
+        let written = codex_direct::initialize_direct(
             state.db.as_ref(),
             &state.codex_oauth_manager,
-            crate::mode::state::op::SWITCH,
             codex_direct::Owner::None,
-            Some(&provider),
+            &provider,
             crate::mode::state::PendingTarget::pointer(Some(provider.id.clone())),
         );
         if let Err(error) = written {
@@ -5985,6 +6167,7 @@ impl ProviderService {
                     settings_config,
                     category,
                     meta.or(stored_meta.as_ref()),
+                    provider_id,
                 )
             }
             AppType::Gemini => gemini_editor::view(state, settings_config, category),
@@ -6039,7 +6222,7 @@ impl ProviderService {
             (AppType::Claude, Some(editor)) => {
                 Self::add_claude_from_editor(state, provider, editor)
             }
-            (AppType::Codex, Some(editor)) => {
+            (AppType::Codex, Some(editor)) if !provider.uses_codex_full_config() => {
                 Self::save_codex_from_editor(state, provider, editor, EditorSaveKind::Add)
             }
             (app_type @ (AppType::Gemini | AppType::GrokBuild), Some(editor)) => {
@@ -6069,6 +6252,15 @@ impl ProviderService {
                 if original_id.is_none_or(|original| original == provider.id) =>
             {
                 Self::update_claude_from_editor(state, provider, editor)
+            }
+            (AppType::Codex, Some(editor)) if provider.uses_codex_full_config() => {
+                Self::update_with_codex_editor(
+                    state,
+                    AppType::Codex,
+                    original_id,
+                    provider,
+                    Some(&editor),
+                )
             }
             (AppType::Codex, Some(editor))
                 if original_id.is_none_or(|original| original == provider.id) =>
@@ -6116,15 +6308,28 @@ impl ProviderService {
             provider.uses_proxy_injected_oauth(),
             editor.on_conflict,
         )?;
-        provider.settings_config = plan.row_settings.clone();
+        let mode = crate::mode::current::mode_state(&app_type);
+        let key_fields = kind.writes_key_fields(state, &app_type, &mode, &provider.id)?;
+        let keep_local = kind == EditorSaveKind::Add
+            && (!key_fields || crate::codex_config::read_optional_codex_config_text()?.is_some());
+        provider.settings_config = plan.row_settings;
+        if keep_local && !plan.edits.is_empty() {
+            let text = editor_toml::config_text(&provider.settings_config);
+            let mut row = text
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|err| AppError::Config(err.to_string()))?;
+            plan.edits.store_in(&mut row);
+            provider.settings_config["config"] = Value::String(row.to_string());
+        }
         Self::validate_provider_settings(&app_type, &provider)?;
         Self::normalize_usage_script_credential_overrides(&app_type, &mut provider);
         if kind == EditorSaveKind::Add {
             keep_common_config_for_old_versions(&mut provider);
         }
-
-        let mode = crate::mode::current::mode_state(&app_type);
-        let key_fields = kind.writes_key_fields(state, &app_type, &mode, &provider.id)?;
+        if keep_local {
+            state.db.save_provider(&app_type, &provider)?;
+            return Ok(true);
+        }
 
         state.db.save_provider(&app_type, &provider)?;
         let written = if key_fields {
@@ -6341,6 +6546,16 @@ impl ProviderService {
         app_type: AppType,
         original_id: Option<&str>,
         provider: Provider,
+    ) -> Result<bool, AppError> {
+        Self::update_with_codex_editor(state, app_type, original_id, provider, None)
+    }
+
+    fn update_with_codex_editor(
+        state: &AppState,
+        app_type: AppType,
+        original_id: Option<&str>,
+        provider: Provider,
+        editor: Option<&EditorSave>,
     ) -> Result<bool, AppError> {
         let _native_guard = lock_native_provider_operations(state, &app_type);
         let mut provider = provider;
@@ -6566,9 +6781,10 @@ impl ProviderService {
         if matches!(app_type, AppType::Codex) {
             return Self::update_codex(
                 state,
-                &provider,
+                provider,
                 existing_provider.as_ref(),
                 is_direct_current,
+                editor,
             );
         }
         // Desktop 直连模式下正在用的这张卡改成了要经路由的（模型映射、托管账号）：直连写不
@@ -6615,31 +6831,67 @@ impl ProviderService {
     /// - 其余只存行。
     fn update_codex(
         state: &AppState,
-        provider: &Provider,
+        mut provider: Provider,
         existing: Option<&Provider>,
         is_direct_current: bool,
+        editor: Option<&EditorSave>,
     ) -> Result<bool, AppError> {
         let app_type = AppType::Codex;
         let mode = crate::mode::current::mode_state(&app_type);
         if !mode.is_proxy() && !is_direct_current {
-            state.db.save_provider(&app_type, provider)?;
+            state.db.save_provider(&app_type, &provider)?;
             return Ok(true);
         }
+        let mut expected_live = None;
+        // An active managed card can opt into full-file mode. Its full editor
+        // also opened from disk, so it receives the same three-way comparison.
+        if !mode.is_proxy() && provider.uses_codex_full_config() {
+            if let Some(old) =
+                existing.filter(|old| old.uses_codex_full_config() || editor.is_some())
+            {
+                if let Some(disk) = codex_full_config::active_text(&state.db, &provider)? {
+                    let base = editor
+                        .map(|edit| &edit.base)
+                        .unwrap_or(&old.settings_config);
+                    let edited = editor_toml::config_text(&provider.settings_config);
+                    let policy = editor.map(|edit| edit.on_conflict).unwrap_or_default();
+                    let selected = codex_full_config::edited_text(
+                        editor_toml::config_text(base),
+                        edited,
+                        &disk,
+                        policy,
+                    )?;
+                    if old.uses_codex_full_config() && selected == disk {
+                        // Saving only metadata (or keeping an external edit) is not a switch.
+                        // In particular it must not touch the current native login.
+                        provider.settings_config["config"] = Value::String(disk);
+                        state.db.save_provider(&app_type, &provider)?;
+                        return Ok(true);
+                    }
+                    if selected != edited {
+                        provider.settings_config["config"] = Value::String(selected.to_owned());
+                        Self::validate_provider_settings(&app_type, &provider)?;
+                    }
+                    expected_live = Some(disk);
+                }
+            }
+        }
         if !mode.is_proxy() {
-            codex_direct::preflight(state.db.as_ref(), provider)?;
+            codex_direct::preflight(state.db.as_ref(), &provider)?;
         }
 
-        state.db.save_provider(&app_type, provider)?;
+        state.db.save_provider(&app_type, &provider)?;
         let written = if mode.is_proxy() {
-            Self::resync_proxy_for_saved_row(state, &app_type, provider)
+            Self::resync_proxy_for_saved_row(state, &app_type, &provider)
         } else {
-            codex_direct::write_direct(
+            codex_direct::write_direct_from(
                 state.db.as_ref(),
                 &state.codex_oauth_manager,
                 crate::mode::state::op::APPLY,
                 existing.map_or(codex_direct::Owner::None, codex_direct::Owner::Provider),
-                Some(provider),
+                Some(&provider),
                 crate::mode::state::PendingTarget::default(),
+                expected_live,
             )
             .map(|_| ())
         };
@@ -7355,17 +7607,35 @@ impl ProviderService {
             &AppType::Codex,
             crate::mode::current::Purpose::Direct,
         )?;
-        let owner = current_id
-            .as_deref()
-            .and_then(|current_id| providers.get(current_id))
-            .map_or(codex_direct::Owner::None, codex_direct::Owner::Provider);
-        codex_direct::write_direct(
+        let previous = current_id.as_deref().and_then(|id| providers.get(id));
+        let disk = match previous {
+            Some(previous) if previous.uses_codex_full_config() => {
+                // Validate the incoming card before recording changes to the outgoing card.
+                if previous.id != provider.id {
+                    codex_direct::preflight(&state.db, provider)?;
+                }
+                codex_full_config::adopt_active(&state.db, previous)?
+            }
+            _ => None,
+        };
+        let mut adopted;
+        let target = match &disk {
+            Some(text) if current_id.as_deref() == Some(&provider.id) => {
+                adopted = provider.clone();
+                adopted.settings_config["config"] = Value::String(text.clone());
+                &adopted
+            }
+            _ => provider,
+        };
+        let owner = previous.map_or(codex_direct::Owner::None, codex_direct::Owner::Provider);
+        codex_direct::write_direct_from(
             state.db.as_ref(),
             &state.codex_oauth_manager,
             crate::mode::state::op::SWITCH,
             owner,
-            Some(provider),
+            Some(target),
             crate::mode::state::PendingTarget::pointer(Some(provider.id.clone())),
+            disk,
         )?;
 
         let mut result = SwitchResult::default();
@@ -7434,6 +7704,9 @@ impl ProviderService {
         let providers = state.db.get_all_providers(&app_type)?;
 
         for provider in providers.values() {
+            if app_type == AppType::Codex && provider.uses_codex_full_config() {
+                continue;
+            }
             if provider
                 .meta
                 .as_ref()
@@ -8219,7 +8492,9 @@ impl ProviderService {
                     ));
                 }
 
-                if let Some(config_value) = settings.get("config") {
+                if provider.uses_codex_full_config() {
+                    codex_full_config::text(provider)?;
+                } else if let Some(config_value) = settings.get("config") {
                     if !(config_value.is_string() || config_value.is_null()) {
                         return Err(AppError::localized(
                             "provider.codex.config.invalid_type",

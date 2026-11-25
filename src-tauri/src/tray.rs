@@ -1240,7 +1240,9 @@ fn codex_wire_api(config_text: &str) -> Option<String> {
 /// 这家在这个应用下必须经过路由服务才能用（直连写进去也用不了）。和前端
 /// `providerNeedsRouting`（`src/utils/providerCapabilities.ts`）是同一条规则，改一边要改另一边。
 pub(crate) fn provider_needs_routing(app: &AppType, provider: &Provider) -> bool {
-    if is_official_account(app, provider) {
+    if is_official_account(app, provider)
+        || (*app == AppType::Codex && provider.uses_codex_full_config())
+    {
         return false;
     }
     let meta = provider.meta.as_ref();
