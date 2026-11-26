@@ -206,6 +206,8 @@ fn validate_routes(root: &dyn TableLike) -> Result<(), AppError> {
     Ok(())
 }
 
+type OutgoingFields = Vec<(String, TomlValue)>;
+
 #[derive(Serialize, Deserialize)]
 struct SavedBase {
     managed: Option<String>,
@@ -246,7 +248,7 @@ impl Base {
         }
     }
 
-    pub fn outgoing(&self) -> Result<Option<Vec<(String, TomlValue)>>, AppError> {
+    pub fn outgoing(&self) -> Result<Option<OutgoingFields>, AppError> {
         self.saved
             .as_ref()
             .map(|saved| {
@@ -366,7 +368,7 @@ fn encode(base: &SavedBase) -> Result<Vec<u8>, AppError> {
     serde_json::to_vec(base).map_err(|e| AppError::Message(e.to_string()))
 }
 
-pub(super) fn managed_base() -> Result<(DocumentMut, Option<Vec<(String, TomlValue)>>), AppError> {
+pub(super) fn managed_base() -> Result<(DocumentMut, Option<OutgoingFields>), AppError> {
     let path = get_codex_config_path();
     let base = Base::read(&DeviceStore::for_device(), &path)?;
     let doc = parse(&path, base.managed(&path)?.as_deref())?;

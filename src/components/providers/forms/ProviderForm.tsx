@@ -91,7 +91,7 @@ import {
   setCodexWireApi,
   extractCodexModelName,
   setCodexModelName as setCodexModelNameInConfig,
-} from "@/utils/providerConfigUtils";
+} from "@/utils/codexConfigUtils";
 import { getCodexCustomTemplate } from "@/config/codexTemplates";
 import CodexConfigEditor from "./CodexConfigEditor";
 import { CommonConfigEditor } from "./CommonConfigEditor";
@@ -125,6 +125,7 @@ import { AgyAccountSelect } from "./AgyOAuthSection";
 import { ClaudeAccountSelect } from "./ClaudeOfficialSection";
 import { McodeProviderForm } from "./McodeProviderForm";
 import { WorkBuddyProviderForm } from "./WorkBuddyProviderForm";
+import { CodebuddyProviderForm } from "./CodebuddyProviderForm";
 import { PiProviderForm } from "./PiProviderForm";
 import { OmoFormFields } from "./OmoFormFields";
 import { parseOmoOtherFieldsObject } from "@/types/omo";
@@ -379,6 +380,7 @@ export function ProviderForm(props: ProviderFormProps) {
   if (props.appId === "mcode" || props.appId === "dsh")
     return <McodeProviderForm {...props} />;
   if (props.appId === "workbuddy") return <WorkBuddyProviderForm {...props} />;
+  if (props.appId === "codebuddy") return <CodebuddyProviderForm {...props} />;
   if (appHas(props.appId, "piFamily")) {
     return <PiProviderForm {...props} />;
   }

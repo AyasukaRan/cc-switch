@@ -171,6 +171,7 @@ impl ModelPricing {
         let candidates = crate::services::usage_stats::model_pricing_candidates(model);
         let Some((id, (numerator, denominator))) = candidates
             .iter()
+            .map(|candidate| candidate.model_id.as_str())
             .find_map(|id| codex_tier_ratio(id, tier, created_at).map(|ratio| (id, ratio)))
         else {
             return self.clone();
