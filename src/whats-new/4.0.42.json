@@ -1,6 +1,14 @@
 {
   "version": "4.0.42",
+  "channel": "custom",
   "items": [
+    {
+      "type": "improve",
+      "zh": "从 ran v4.0.36 升级时保留已有 Codex 请求的计费档位",
+      "zh-TW": "從 ran v4.0.36 升級時保留既有 Codex 請求的計費檔位",
+      "en": "Upgrading from ran v4.0.36 preserves the billing tiers of past Codex requests",
+      "ja": "ran v4.0.36 からの更新時に過去の Codex リクエストの料金区分を保持"
+    },
     {
       "type": "new",
       "zh": "GitHub Copilot 支持 Auto 自动选模型，Free 账号也能用",
